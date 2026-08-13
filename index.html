@@ -1,0 +1,1302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Nemotron 3.5 Lightning 30B-A3B — hybrid Mamba·MoE·Attention explorer</title>
+<meta name="description" content="Interactive 3D architecture explorer for NVIDIA-Nemotron-3.5-Lightning-30B-A3B: 52-layer NemotronH hybrid — 23 Mamba-2 layers, 6 attention layers, 23 pure MoE layers (128 experts, top-6 + shared). BF16 reference vs NVFP4 mixed-precision repos, byte-true volumes." />
+<style>
+  html,body{margin:0;padding:0;background:#0A0C0A;height:100%;overflow:hidden}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<noscript><div style="color:#EDF3EC;font-family:monospace;padding:2em">This explorer needs JavaScript.</div></noscript>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script type="module">
+import { html, render, useState, useRef, useEffect, useCallback } from "https://unpkg.com/htm@3.1.1/preact/standalone.module.js";
+const THREE = window.THREE;
+const T = {
+  bg: "#0A0C0A", panel: "#0E120E", raised: "#161C16", line: "#1F2A1F",
+  paper: "#EDF3EC", mut: "#9CAA9A", faint: "#5F705E",
+  serif: "'Iowan Old Style','Palatino Linotype',Palatino,Georgia,serif",
+  mono: "ui-monospace,'SF Mono','Cascadia Code','JetBrains Mono',Menlo,Consolas,monospace",
+};
+const C = {
+  bg: T.bg, panel: T.panel,
+  embed: "#4FC8E8", head: "#8CA9FF",
+  mamba: "#3ECFCB", attn: "#FFB248", spine: "#FFB248",
+  moe: "#8FD400", shexp: "#E2EA6A", router: "#C79BFF",
+  norm: "#86D08A", ssm: "#3ECFCB",
+  mtp: "#E58CFF", dim: "#5F705E", accent: "#76B900",
+};
+const CAT_COLOR = {
+  norm: C.norm, attn: C.attn, ssm: C.ssm,
+  moe: C.moe, shexp: C.shexp, router: C.router,
+  embed: C.embed, head: C.head,
+};
+const CFG = {
+  hidden: 2688, layers: 52, vocab: 131072, ctx: 262144, ctxExt: 1048576,
+  heads: 32, kv: 2, headDim: 128, ropeTheta: 10000, partialRotary: 1.0, normEps: 1e-5,
+  mamba: { heads: 64, headDim: 64, state: 128, groups: 8, conv: 4, inner: 4096, convDim: 6144, chunk: 128 },
+  moe: { experts: 128, topk: 6, inter: 1856, sharedInter: 3712, scale: 2.5 },
+  bos: 1, eos: 2, pad: 0,
+};
+const BLOCK_TYPES = ["mamba","moe","mamba","moe","mamba","attention","moe","mamba","moe","mamba","moe","mamba","attention","moe","mamba","moe","mamba","moe","mamba","attention","moe","mamba","moe","mamba","moe","mamba","attention","moe","mamba","moe","mamba","moe","mamba","attention","moe","mamba","moe","mamba","moe","mamba","moe","mamba","attention","moe","mamba","moe","mamba","moe","mamba","moe","mamba","moe"];
+const NVFP4_BYTES = 0.5 + 1 / 16;
+const FP8_BYTES = 1.0;
+const BF16_BYTES = 2;
+const PREC = {
+  bf16:  { label: "BF16 · REFERENCE", repo: "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 · everything BF16", c: "#8CA9FF" },
+  nvfp4: { label: "NVFP4 · MIXED", repo: "…-30B-A3B-NVFP4 · experts+head 4-bit · Mamba proj FP8 · attention BF16", c: "#8FD400" },
+};
+const bytesFor = (w, prec) => prec === "nvfp4" ? (w.q === "nvfp4" ? NVFP4_BYTES : w.q === "fp8" ? FP8_BYTES : BF16_BYTES) : BF16_BYTES;
+const prod = (d) => d.reduce((a, b) => a * b, 1);
+const grp = (n) => n.toLocaleString("en-US").replace(/,/g, " ");
+function fP(m) {
+  if (m >= 1e6) return (m / 1e6).toFixed(2) + "T";
+  if (m >= 1000) return (m / 1000).toFixed(m >= 100000 ? 0 : 2) + "B";
+  if (m >= 1) return m.toFixed(1) + "M";
+  return (m * 1000).toFixed(0) + "K";
+}
+function W(n, dims, q, cat, count = 1) {
+  const per = prod(dims);
+  return {
+    n, dims, q, cat, count, color: CAT_COLOR[cat],
+    s: "[" + dims.map(grp).join(", ") + "]" + (count > 1 ? " ×" + count : ""),
+    rows: dims[0] || 1, cols: dims[1] || dims[0] || 1,
+    pM: (per * count) / 1e6,
+    dt: (p) => p === "nvfp4" ? (q === "nvfp4" ? "NVFP4" : q === "fp8" ? "FP8" : "BF16") : "BF16",
+  };
+}
+const MAMBA = [
+  W("norm.weight", [2688], "bf16", "norm"),
+  W("mixer.in_proj.weight  (z 4096 + x 4096 + B 1024 + C 1024 + Δt 64, fused)", [2688, 10304], "fp8", "ssm"),
+  W("mixer.conv1d.weight  (kernel 4, depthwise + bias)", [4, 6144], "bf16", "ssm"),
+  W("mixer.A_log  (learned decay)", [64], "bf16", "ssm"),
+  W("mixer.D  (per-head skip)", [64], "bf16", "ssm"),
+  W("mixer.dt_bias", [64], "bf16", "ssm"),
+  W("mixer.norm.weight  (gated RMSNorm)", [4096], "bf16", "norm"),
+  W("mixer.out_proj.weight", [4096, 2688], "fp8", "ssm"),
+];
+function mkAttn(px = "") {
+  return [
+    W(px + "norm.weight", [2688], "bf16", "norm"),
+    W(px + "mixer.q_proj.weight", [2688, 4096], "bf16", "attn"),
+    W(px + "mixer.k_proj.weight  (GQA)", [2688, 256], "bf16", "attn"),
+    W(px + "mixer.v_proj.weight  (GQA)", [2688, 256], "bf16", "attn"),
+    W(px + "mixer.o_proj.weight", [4096, 2688], "bf16", "attn"),
+  ];
+}
+function mkMoe(q, px = "") {
+  return [
+    W(px + "norm.weight", [2688], "bf16", "norm"),
+    W(px + "mixer.gate.weight  (router → 128 logits)", [2688, 128], "bf16", "router"),
+    W(px + "mixer.experts.up_proj.weight", [2688, 1856], q, "moe", 128),
+    W(px + "mixer.experts.down_proj.weight", [1856, 2688], q, "moe", 128),
+    W(px + "mixer.shared_experts.up_proj.weight  (2× width)", [2688, 3712], q, "shexp"),
+    W(px + "mixer.shared_experts.down_proj.weight", [3712, 2688], q, "shexp"),
+  ];
+}
+const ATTN = mkAttn();
+const MOE = mkMoe("nvfp4");
+const MTP = [...mkAttn("mtp."), ...mkMoe("bf16", "mtp.")];
+const EMBED = [W("backbone.embeddings.weight", [2688, 131072], "bf16", "embed")];
+const HEAD = [
+  W("backbone.norm_f.weight", [2688], "bf16", "norm"),
+  W("lm_head.weight", [2688, 131072], "nvfp4", "head"),
+];
+function weightsFor(arche) {
+  switch (arche) {
+    case "embed": return EMBED;
+    case "head": return HEAD;
+    case "mtp": return MTP;
+    case "nh_mamba": return MAMBA;
+    case "nh_attn": return ATTN;
+    case "nh_moe": return MOE;
+    default: return [];
+  }
+}
+const sum = (ws, k) => ws.reduce((a, w) => a + w[k], 0);
+const vramMB = (ws, prec) => ws.reduce((a, w) => a + w.pM * bytesFor(w, prec), 0);
+const actMB = (ws) => ws.reduce((a, w) => a + (w.cat === "moe" ? w.pM * (CFG.moe.topk / CFG.moe.experts) : w.pM), 0);
+function buildLayers() {
+  const L = [];
+  const mk = (t, label, arche, idx) => {
+    const ws = weightsFor(arche);
+    return { t, label, arche, idx, tp: sum(ws, "pM") };
+  };
+  L.push(mk("embed", "Token Embedding", "embed", -1));
+  BLOCK_TYPES.forEach((bt, i) => {
+    if (bt === "mamba") L.push(mk("mamba", `Layer ${i} · MAMBA-2 · SSD recurrence`, "nh_mamba", i));
+    else if (bt === "attention") L.push(mk("attn", `Layer ${i} · ATTENTION · GQA 16:1`, "nh_attn", i));
+    else L.push(mk("moe", `Layer ${i} · MIXTURE OF EXPERTS · 128 → 6 + 1`, "nh_moe", i));
+  });
+  L.push(mk("head", "LM Head", "head", -1));
+  L.push(mk("mtp", "MTP · Multi-Token Prediction", "mtp", 52));
+  return L;
+}
+const LAYERS = buildLayers();
+const STACK_N = LAYERS.length;
+const TRUNK_P = LAYERS.filter((l) => l.t !== "mtp").reduce((a, l) => a + l.tp, 0);
+const MTP_P = LAYERS.find((l) => l.t === "mtp").tp;
+const MAMBA_LAYERS = LAYERS.filter((l) => l.t === "mamba").length;
+const ATTN_LAYERS = LAYERS.filter((l) => l.t === "attn").length;
+const MOE_LAYERS = LAYERS.filter((l) => l.t === "moe").length;
+const MAMBA_P = LAYERS.filter((l) => l.t === "mamba").reduce((a, l) => a + l.tp, 0);
+const ATTN_P = LAYERS.filter((l) => l.t === "attn").reduce((a, l) => a + l.tp, 0);
+const ROUTED_P = MOE.filter((w) => w.cat === "moe").reduce((a, w) => a + w.pM, 0) * MOE_LAYERS;
+const SHEXP_P = MOE.filter((w) => w.cat === "shexp").reduce((a, w) => a + w.pM, 0) * MOE_LAYERS;
+const ROUTER_P = MOE.filter((w) => w.cat === "router").reduce((a, w) => a + w.pM, 0) * MOE_LAYERS;
+const EMBH_P = EMBED[0].pM + HEAD[0].pM + HEAD[1].pM;
+const ACT_TOTAL = EMBH_P + LAYERS.filter((l) => l.t === "mamba" || l.t === "attn").reduce((a, l) => a + l.tp, 0)
+  + LAYERS.filter((l) => l.t === "moe").reduce((a, l) => a + actMB(weightsFor(l.arche)), 0);
+const ACT_NOEMB = ACT_TOTAL - EMBH_P;
+const MOE_LAYER_P = MOE.reduce((a, w) => a + w.pM, 0);
+const MOE_LAYER_ACT = actMB(MOE);
+const EXPERT_P = 2 * 2688 * 1856 / 1e6;
+const SHARED_P = 2 * 2688 * 3712 / 1e6;
+const VRAM = {
+  bf16: LAYERS.reduce((a, l) => a + vramMB(weightsFor(l.arche), "bf16"), 0) / 1000,
+  nvfp4: LAYERS.reduce((a, l) => a + vramMB(weightsFor(l.arche), "nvfp4"), 0) / 1000,
+};
+const KV_PER_TOK_LAYER = CFG.kv * CFG.headDim * 2 * 2;
+const KV_256K = (ATTN_LAYERS * KV_PER_TOK_LAYER * CFG.ctx) / 1e9;
+const KV_1M = (ATTN_LAYERS * KV_PER_TOK_LAYER * CFG.ctxExt) / 1e9;
+const KV_1M_FP8 = KV_1M / 2;
+const KV_ALL52_1M = (CFG.layers * KV_PER_TOK_LAYER * CFG.ctxExt) / 1e9;
+const MAMBA_STATE_MB = MAMBA_LAYERS * (CFG.mamba.heads * CFG.mamba.headDim * CFG.mamba.state * 4 + CFG.mamba.convDim * (CFG.mamba.conv - 1) * 4) / 1e6;
+const SNAP = 0.0005;
+const slerp = (c, t, f) => { const d = t - c; return Math.abs(d) < SNAP ? t : c + d * f; };
+const SPREAD = 13, LERP = 0.14;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const layerColor = (l) =>
+  l.t === "embed" ? C.embed : l.t === "head" ? C.head : l.t === "mtp" ? C.mtp :
+  l.t === "attn" ? C.attn : l.t === "moe" ? C.moe : C.mamba;
+const fmtGB = (gb) => gb >= 1000 ? (gb / 1000).toFixed(2) + " TB" : gb < 1 ? (gb * 1000).toFixed(0) + " MB" : gb.toFixed(1) + " GB";
+const EXPLAIN = {
+  embed: { t: "Token embedding", b: "A 131,072 × 2,688 lookup (~352M params): Nemotron's 128k tokenizer, padded to a clean power of two. Untied from the LM head (tie_word_embeddings: false), so the model carries two of these tables. Refreshingly tidy special tokens straight from config.json: pad 0, bos 1, eos 2. Always BF16 — backbone.embeddings sits in the quantizer's ignore list." },
+  head: { t: "LM head", b: "Final RMSNorm over the 2,688-dim residual stream, then an untied 2,688 → 131,072 unembedding (~352M params). Here lives the recipe's boldest call: in the NVFP4 repo the LM HEAD ITSELF is quantized to 4-bit (W4A16, one FP8 scale per 16 weights) — the logits are computed from FP4 weights — while every attention projection in the model stays BF16. Most quantization recipes make exactly the opposite bet." },
+  nh_mamba: { t: "Mamba-2 layer · SSD recurrence", b: "A pure state-space block — no FFN follows; the next layer handles that. One fused matmul expands 2,688 → 10,304: a 4,096-dim value stream x (64 heads × 64), its silu gate z, per-group state projections B and C (8 groups × 128 — heads share B/C in groups of 8), and 64 per-head timesteps Δt. A kernel-4 depthwise conv smooths x, B, C, then the SSD recurrence (chunk 128) read-modify-writes a constant 64 × (64×128) state — ~2.2 MB in F32 — steered by learned decay A_log, timestep bias dt_bias (Δt clamped to [0.001, 0.1]) and a per-head skip D. A gated RMSNorm (silu(z) ⊙ ·) filters what re-enters the residual stream. Cost per token is O(1) whether the context holds 10 tokens or 1,048,576. 23 of 52 layers work this way. In the NVFP4 repo only the two big projections go FP8 — weights AND activations, static scales — while the conv and the tiny per-head params stay BF16." },
+  nh_attn: { t: "Attention layer · GQA 16:1", b: "Classic softmax attention over the whole window: 32 query heads share just 2 KV heads at head_dim 128 — 16:1 grouped-query attention, rotary over the FULL head (partial_rotary_factor 1.0) at θ = 10,000, no biases, no QK-norm. Only 6 of the 52 layers attend at all — indices 5, 12, 19, 26, 33, 42 — making them the model's entire random-access memory, and the only layers paying KV-cache rent: 1 KB per token per layer in BF16, halved by the FP8 KV-cache scheme at deployment. All four projections are named in the quantizer's ignore list: attention stays BF16 in both repos." },
+  nh_moe: { t: "MoE layer — a pure expert block", b: "Where a dense model would put one FFN, 23 of the 52 layers are nothing but experts: 128 relu² MLPs (2,688 → 1,856 → 2,688 — squared-ReLU, so just up and down, NO gate matrix; two matrices per expert, 9.98M each). A router (2,688 → 128) scores them, keeps the top-6, normalizes their weights (norm_topk_prob) and scales the mix by 2.5 (routed_scaling_factor). One always-on shared expert at exactly double width (3,712 = 2 × 1,856) is added on top. Per token ≈ 80M of the layer's 1.30B fire — 6.2%. Model-wide: 128 × 23 = 2,944 routed experts hold 29.4B of the 31.6B trunk — 93% of the model, and precisely the tensors the NVFP4 repo compresses to 4 bits." },
+  spine: { t: "The attention spine", b: "The amber bus marks the 6 attention layers — indices 5, 12, 19, 26, 33, 42, roughly every 7th slot. They are the model's only random-access memory over the context and the only layers with a growing cache: 1 KB per token per layer in BF16 (0.5 KB with the FP8 KV scheme). Across all six that's ~1.6 GB at 256K and ~6.4 GB at 1M — versus ~55.8 GB if all 52 layers attended. The other 46 layers carry either a constant ~2.2 MB Mamba-2 state (23 layers, ~50 MB total) or no sequence state at all (the 23 MoE layers). That asymmetry is why a 30B model serves a million-token window on one GPU." },
+  nvfp4: { t: "NVFP4 — a three-tier mixed recipe", b: "The NVFP4 repo (producer modelopt, quant_algo MIXED_PRECISION) is legible straight from its target lists. Tier 1 — NVFP4: 4-bit float weights with one FP8 scale per 16-weight group, W4A16 (activations stay BF16), applied to all 2,944 routed experts, all 23 shared experts, and the LM head. Tier 2 — FP8: 8-bit weights AND input activations with static scales (W8A8), applied to the 46 big Mamba projections (in_proj and out_proj in every Mamba layer). Tier 3 — untouched BF16, from the ignore list: embeddings, every conv1d, every router, every attention projection, all norms, and the entire MTP module ('mtp*'). The KV cache is FP8 on top. Because the experts are 93% of the weights, the checkpoint shrinks ≈3.1×: ≈21.5 GB derived here vs ≈65.8 GB BF16 — small enough for a DGX Spark or an RTX 5090. Everywhere in this explorer box volume tracks bytes on disk: flip precision and watch the green mass collapse while attention holds perfectly still." },
+  mtp: { t: "MTP — a 1.3B speculative head", b: "Multi-token prediction: above the LM head the checkpoint ships one extra attention block and one extra MoE block (~1.32B params — mtp_layers_block_type: ['attention', 'moe']). Trained in a dedicated continued-pre-training stage, the MTP head predicts tokens beyond the next one — a richer training signal, faster RL rollouts, and EAGLE-style self-speculative decoding at inference (SGLang: 5 draft steps, 6 draft tokens). The quantizer ignores 'mtp*' entirely, so even its 128 experts stay BF16 inside the NVFP4 repo. And Lightning doesn't stop there: TWO external drafters ship as separate NVFP4 checkpoints — DSpark, a semi-autoregressive drafter that proposes a whole block of tokens per forward pass (the recommended default for DGX Spark and low-concurrency serving), and DFlash, a block-diffusion drafter (block 6 on B200, 4 on H100)." },
+  oddments: { t: "The odd numbers", b: "Worth staring at: the experts are relu² — squared ReLU, up and down only, no SwiGLU gate, so each expert is TWO matrices, not three; the LM head goes 4-bit while every attention projection stays BF16 — the inverse of the usual precision bet — and the always-on shared expert is 4-bit too; RoPE θ is 10,000 — the classic short-context base — on a 1M-token window, viable because only 6 layers attend at all; the config still carries expand: 2 (which would give 5,376) but the real inner width is mamba_num_heads × mamba_head_dim = 4,096 — the field is vestigial; the shared expert is exactly two routed experts wide (3,712 = 2 × 1,856); the SSM cache is pinned F32 in config, yet the single-H100 recipe drops it to FP16 with stochastic rounding (philox rounds 5) to fit; bos 1, eos 2, pad 0; and the model was PRE-TRAINED in NVFP4 for 20T+ tokens — the 4-bit checkpoint isn't an afterthought, it's the native habitat." },
+  recon: { t: "31.6B derived vs the 30B label", b: "Every count here is summed from config.json shapes: 1 embedding + 23 × 8 Mamba tensors + 6 × 5 attention tensors + 23 × 6 MoE tensors + 2 head tensors give a 31.6B trunk, plus the 1.32B MTP block — the hub lists 32B; the tin says 30B. Activating embed + head + all Mamba + all attention + router + shared + 6 of 128 experts per MoE layer gives 3.58B per token; drop the two 352M vocabulary matrices and it's 2.88B — the 'A3B' label counts non-embedding parameters. Trust the shapes." },
+  ctx: { t: "256K → 1M — two configs, one model", b: "The BF16 config declares max_position_embeddings 262,144; the NVFP4 config — identical architecture — declares 1,048,576, and the card supports up to 1M (256K validated on a single H100 in BF16, which is memory-bound; the full window on 8×H100, GB200 or B200). The hybrid makes 1M cheap: only 6 of 52 layers keep a KV cache, so a million tokens cost ~6.4 GB of KV in BF16 (~3.2 GB with the FP8 scheme) instead of the ~55.8 GB an all-attention 52-layer stack would need, while the 23 Mamba layers hold a constant ~50 MB combined regardless of length." },
+};
+function explainLayer(l) {
+  const k = l.t === "mamba" ? "nh_mamba" : l.t === "attn" ? "nh_attn" : l.t === "moe" ? "nh_moe" : l.t;
+  return EXPLAIN[k] || { t: l.label, b: "" };
+}
+function explainWeight(w) {
+  let n = w.n;
+  if (n.startsWith("mtp.")) n = n.slice(4);
+  if (n.includes("in_proj")) return { t: "Fused SSD input projection", b: "2,688 → 10,304 in one matmul: the 4,096-dim value stream x (64 heads × 64), its silu gate z (4,096), state projections B and C (8 groups × 128 each — heads share them 8-to-a-group), and 64 per-head timesteps Δt. In the NVFP4 repo this runs FP8 for both weights and activations (static scales) — one of only two quantized tensors in a Mamba layer." };
+  if (n.includes("conv1d")) return { t: "Causal conv, kernel 4", b: "A depthwise 1-D convolution (with bias — use_conv_bias: true) over the 6,144-dim xBC stream: each channel sees itself and the 3 previous tokens. Standard Mamba-family smoothing before the recurrence; ~31K params, and one of the tensors the quantizer explicitly ignores." };
+  if (n.includes("A_log")) return { t: "Learned base decay (A_log)", b: "64 learned scalars — each head's resting forgetting rate, in log space, discretized per token via Δt. Possibly the highest leverage-per-byte tensor in the checkpoint; stored in higher precision (the hub shows F32 tensors alongside BF16)." };
+  if (n.includes("dt_bias")) return { t: "Δt bias", b: "64 learned scalars biasing each head's timestep. At runtime Δt is clamped: floor 1e-4, min 1e-3, max 0.1 — the discretization knobs inherited from the SSM lineage. The SSM cache itself is pinned F32 (mamba_ssm_cache_dtype)." };
+  if (n.includes("mixer.D")) return { t: "Per-head skip (D)", b: "64 scalars adding a direct x → output path around the recurrence per head — the classic Mamba residual-inside-the-mixer term." };
+  if (n.includes("mixer.norm")) return { t: "Gated RMSNorm", b: "4,096 scales normalizing the SSD output, gated by silu(z): what the state remembers is not automatically what re-enters the residual stream — this decides. The Mamba-2 signature output stage." };
+  if (n.includes("q_proj")) return { t: "Query projection", b: "2,688 → 4,096: 32 query heads × 128 dims. Rotary position over the full head at θ = 10,000 — a strikingly small base for a 1M window; the hybrid leans on Mamba for length, not on RoPE extrapolation. BF16 in both repos (ignore list)." };
+  if (n.includes("k_proj")) return { t: "Key projection (GQA)", b: "2,688 → 256: just 2 KV heads × 128 serving all 32 query heads — 16:1 grouped-query attention. Together with values, a token's KV write is only 1 KB per attention layer, and only 6 layers pay it." };
+  if (n.includes("v_proj")) return { t: "Value projection (GQA)", b: "2,688 → 256: the 2 value heads. At deployment the KV cache is stored in FP8 (kv_cache_scheme: 8-bit float, static) — halving the already-tiny cache." };
+  if (n.includes("o_proj")) return { t: "Attention output projection", b: "4,096 → 2,688: folds the 32 head outputs back into the residual stream. Every attention projection in the model is in the quantizer's ignore list — attention is the precision-protected pathway here." };
+  if (n.includes("gate.weight")) return { t: "Router", b: "2,688 → 128 logits: scores every expert for this token, keeps the top-6, normalizes their weights (norm_topk_prob: true) and scales the routed mix by 2.5 (routed_scaling_factor). Just 0.34M params steering 1.28B — which is exactly why the recipe refuses to quantize it: every router sits in the ignore list, BF16." };
+  if (n.includes("experts.up_proj") || n.includes("experts.down_proj")) return { t: "Routed expert bank — relu² " + (n.includes("up_proj") ? "up" : "down"), b: "128 parallel " + (n.includes("up_proj") ? "2,688 → 1,856" : "1,856 → 2,688") + " matrices, one per expert. The activation is relu² (squared ReLU), so there is NO gate matrix — each expert is two matmuls, not the usual SwiGLU three. Per token only the 6 routed winners run; 122 sit idle. These banks are the heart of the NVFP4 repo: 4-bit float weights, one FP8 scale per 16-weight group, BF16 activations (W4A16)." };
+  if (n.includes("shared_experts")) return { t: "Shared expert", b: "One always-on expert at exactly DOUBLE the routed width (3,712 = 2 × 1,856), added for every token regardless of routing — a guaranteed generalist beneath the 128 specialists, with no gate scalar of its own. Unlike most recipes, it does NOT get a precision pass: it's quantized to NVFP4 right alongside the routed banks." };
+  if (n.startsWith("backbone.embeddings")) return { t: "Token table", b: "131,072 rows × 2,688 — one vector per vocabulary entry, untied from the head. BF16 in both repos; the quantizer ignores it." };
+  if (n.startsWith("backbone.norm_f")) return { t: "Final RMSNorm", b: "The last normalization before the head reads the residual stream. eps 1e-5." };
+  if (n.startsWith("lm_head")) return { t: "Unembedding — 4-bit logits", b: "2,688 → 131,072 logits, untied ~352M params. The recipe's boldest choice: quantized to NVFP4 (W4A16, group 16) in the mixed repo — 4-bit weights compute the final logits — while attention stays BF16. Most recipes protect the head above all else; this one protects attention instead." };
+  if (n.includes("norm.weight")) return { t: "Block pre-norm", b: "RMSNorm on the residual stream before the mixer (pre-norm, eps 1e-5, no bias): 2,688 learned scales. Each NemotronH layer is norm + ONE mixer — there is no second norm or FFN inside the block; the next layer in the deck plays that role." };
+  return { t: n, b: "" };
+}
+function App() {
+  const mountRef = useRef(null);
+  const overlayRef = useRef(null);
+  const tipRef = useRef(null);
+  const st = useRef({
+    theta: 0.55, phi: 1.05, dist: 62, tTheta: 0.55, tPhi: 1.05, tDist: 62,
+    panX: 0, panY: 0, panZ: 0, tPanX: 0, tPanY: 0, tPanZ: 0, tCenterY: null,
+    dragging: false, panDrag: false, pinch: false, pDist: 0, pMidX: 0, pMidY: 0,
+    dx0: 0, dy0: 0, moved: false, mx: -99, my: -99, mxPx: -999, myPx: -999,
+    tapT: 0, pendingTap: false,
+    hovered: -1, selected: -1, hovSubId: -1, hovSpine: -1,
+    expand: new Float32Array(LAYERS.length),
+    showLabels: false, showSpine: true, floor: false, explain: true,
+    filters: { norms: true }, time: 0, _lastCompN: null, _lastTip: "",
+    reduceMotion: false,
+  }).current;
+  const [hovUI, setHovUI] = useState(-1);
+  const [selUI, setSelUI] = useState(-1);
+  const [compUI, setCompUI] = useState(null);
+  const [lblUI, setLblUI] = useState(false);
+  const [spineUI, setSpineUI] = useState(true);
+  const [floorUI, setFloorUI] = useState(false);
+  const [prec, setPrec] = useState("nvfp4");
+  const [exUI, setExUI] = useState(true);
+  const precRef = useRef("nvfp4"); precRef.current = prec;
+  const [filters, setFilters] = useState({ norms: true });
+  const [mobile, setMobile] = useState(() => typeof window !== "undefined" && window.innerWidth < 768);
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  useEffect(() => { st.filters = filters; }, [filters]);
+  useEffect(() => {
+    const f = () => setMobile(window.innerWidth < 768);
+    window.addEventListener("resize", f);
+    return () => window.removeEventListener("resize", f);
+  }, []);
+  const selectCb = useRef(() => {});
+  selectCb.current = (idx) => { setSelUI(idx); if (idx >= 0 && window.innerWidth < 768) setSheetOpen(true); };
+  const doSelect = useCallback((idx) => {
+    st.selected = st.selected === idx ? -1 : idx;
+    selectCb.current(st.selected);
+  }, []);
+  const clearSelect = useCallback(() => { st.selected = -1; selectCb.current(-1); }, []);
+  useEffect(() => {
+    const el = mountRef.current, overlayEl = overlayRef.current, tipEl = tipRef.current;
+    if (!el || !overlayEl) return;
+    let Wd = el.clientWidth, Hd = el.clientHeight;
+    const disposables = [];
+    const track = (o) => { disposables.push(o); return o; };
+    st.reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    renderer.setSize(Wd, Hd);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(new THREE.Color(C.bg), 1);
+    el.insertBefore(renderer.domElement, el.firstChild);
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(C.bg, 0.0042);
+    const camera = new THREE.PerspectiveCamera(42, Wd / Hd, 0.1, 900);
+    scene.add(new THREE.AmbientLight(0x8f9c8b, 0.62));
+    const dl = new THREE.DirectionalLight(0xf4ffd8, 0.66); dl.position.set(18, 80, 28); scene.add(dl);
+    const pl = new THREE.PointLight(0x76b900, 0.30, 200); pl.position.set(-30, 40, 18); scene.add(pl);
+    const pl2 = new THREE.PointLight(0xffb248, 0.20, 160); pl2.position.set(30, 20, -12); scene.add(pl2);
+    if (Wd < 560) { st.dist = st.tDist = 96; } else if (Wd < 980) { st.dist = st.tDist = 76; }
+    const _m4 = new THREE.Matrix4(), _v = new THREE.Vector3(),
+          _q = new THREE.Quaternion(), _s = new THREE.Vector3();
+    const pool = [];
+    function poolGet(i) {
+      if (pool[i]) return pool[i];
+      const d = document.createElement("div");
+      d.className = "ink-lbl";
+      const a = document.createElement("div"); a.className = "ink-lbl-a";
+      const b = document.createElement("div"); b.className = "ink-lbl-b";
+      d.appendChild(a); d.appendChild(b);
+      overlayEl.appendChild(d);
+      const rec = { d, a, b, _a: "", _b: "", _c: "" };
+      pool[i] = rec; return rec;
+    }
+    let poolN = 0;
+    const leadSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    leadSvg.setAttribute("style", "position:absolute;inset:0;width:100%;height:100%;pointer-events:none");
+    overlayEl.appendChild(leadSvg);
+    const linePool = []; let lineN = 0;
+    function lineGet(i) {
+      if (linePool[i]) return linePool[i];
+      const ln = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      ln.setAttribute("stroke-width", "1"); ln.setAttribute("stroke-linecap", "round");
+      leadSvg.appendChild(ln); linePool[i] = ln; return ln;
+    }
+    const labelQ = [];
+    const LBL_GAP = 3;
+    function pushLabel(wx, wy, wz, main, sub, color, op, align) {
+      _v.set(wx, wy, wz).project(camera);
+      if (_v.z > 1 || _v.z < -1) return;
+      const sx = (_v.x * 0.5 + 0.5) * Wd, sy = (-_v.y * 0.5 + 0.5) * Hd;
+      if (sx < -180 || sx > Wd + 180 || sy < -60 || sy > Hd + 60) return;
+      const w = Math.max(main.length, (sub || "").length * 0.88) * 7.3 + 8;
+      const h = sub ? 30 : 15;
+      const x0 = align === "right" ? sx - w : align === "center" ? sx - w / 2 : sx;
+      labelQ.push({ sx, sy, ax: sx, ay: sy, x0, x1: x0 + w, h, main, sub, color, op, align });
+    }
+    function commitLabels() {
+      const q = labelQ;
+      const ord = q.map((_, i) => i).sort((a, b) => q[a].sy - q[b].sy || q[a].x0 - q[b].x0);
+      for (let a = 0; a < ord.length; a++) {
+        const A = q[ord[a]];
+        for (let b = 0; b < a; b++) {
+          const B = q[ord[b]];
+          if (A.x0 < B.x1 + LBL_GAP && B.x0 < A.x1 + LBL_GAP) {
+            const need = B.sy + (B.h + A.h) / 2 + LBL_GAP;
+            if (A.sy < need) A.sy = need;
+          }
+        }
+      }
+      for (let i = 0; i < q.length; i++) {
+        const L2 = q[i], r = poolGet(poolN++);
+        if (r._a !== L2.main) { r.a.textContent = L2.main; r._a = L2.main; }
+        if (r._b !== (L2.sub || "")) { r.b.textContent = L2.sub || ""; r.b.style.display = L2.sub ? "block" : "none"; r._b = L2.sub || ""; }
+        if (r._c !== L2.color) { r.a.style.color = L2.color; r._c = L2.color; }
+        const tx = L2.align === "right" ? "-100%" : L2.align === "center" ? "-50%" : "0%";
+        r.d.style.transform = `translate3d(${L2.sx.toFixed(1)}px,${L2.sy.toFixed(1)}px,0) translate(${tx},-50%)`;
+        r.d.style.opacity = L2.op.toFixed(2);
+        r.d.style.display = "block";
+        if (Math.abs(L2.sy - L2.ay) > 6) {
+          const ln = lineGet(lineN++);
+          ln.setAttribute("x1", L2.ax.toFixed(1)); ln.setAttribute("y1", L2.ay.toFixed(1));
+          ln.setAttribute("x2", L2.ax.toFixed(1)); ln.setAttribute("y2", (L2.sy - L2.h / 2 - 1).toFixed(1));
+          ln.setAttribute("stroke", L2.color);
+          ln.setAttribute("opacity", (L2.op * 0.5).toFixed(2));
+          ln.style.display = "block";
+        }
+      }
+      labelQ.length = 0;
+      for (let i = poolN; i < pool.length; i++) if (pool[i]) pool[i].d.style.display = "none";
+      poolN = 0;
+      for (let i = lineN; i < linePool.length; i++) if (linePool[i]) linePool[i].style.display = "none";
+      lineN = 0;
+    }
+    const GAP = 0.05; let y = 0;
+    const meshes = [], baseY = [], proxies = [];
+    const proxyMat = track(new THREE.MeshBasicMaterial({ visible: false }));
+    function addProxy(w, h, d, x, py, z, li) {
+      const pGeo = track(new THREE.BoxGeometry(w, h, d));
+      const pm = new THREE.Mesh(pGeo, proxyMat);
+      pm.position.set(x, py, z); pm.userData = { li };
+      scene.add(pm); proxies.push(pm);
+      return pm;
+    }
+    for (let i = 0; i < STACK_N; i++) {
+      const Ld = LAYERS[i];
+      let h, w, d, col;
+      if (Ld.t === "embed") { h = 0.36; w = 5.6; d = 5.6; col = C.embed; }
+      else if (Ld.t === "head") { h = 0.36; w = 5.6; d = 5.6; col = C.head; }
+      else if (Ld.t === "mtp") { y += 0.55; h = 0.30; w = 4.8; d = 4.8; col = C.mtp; }
+      else if (Ld.t === "attn") { h = 0.17; w = 6.4; d = 6.4; col = C.attn; }
+      else if (Ld.t === "moe") { h = 0.17; w = 5.8; d = 5.8; col = C.moe; }
+      else { h = 0.17; w = 5.1; d = 5.1; col = C.mamba; }
+      const py = y + h / 2; y += h + GAP;
+      const geo = track(new THREE.BoxGeometry(w, h, d));
+      const mat = track(new THREE.MeshPhongMaterial({
+        color: new THREE.Color(col), transparent: true, opacity: 0.82, shininess: 55,
+        emissive: new THREE.Color(col), emissiveIntensity: Ld.t === "attn" ? 0.16 : (Ld.t === "mtp" ? 0.10 : 0),
+      }));
+      const m = new THREE.Mesh(geo, mat);
+      m.position.set(0, py, 0);
+      const wsL = weightsFor(Ld.arche);
+      m.userData = { li: i, baseY: py, baseX: 0, baseZ: 0, h, w, d, col,
+        fpXZ: Math.sqrt(vramMB(wsL, "nvfp4") / vramMB(wsL, "bf16")) };
+      scene.add(m); meshes.push(m); baseY.push(py);
+      addProxy(w, Math.max(h + GAP * 0.9, 0.34), d, 0, py, 0, i);
+    }
+    const stackH = y;
+    const spineX = -8.6;
+    const spineGrp = new THREE.Group(); scene.add(spineGrp);
+    const segs = [], globalIdxs = [];
+    let firstG = -1, lastG = -1;
+    for (let i = 1; i <= CFG.layers; i++) {
+      if (LAYERS[i].t === "attn") {
+        globalIdxs.push(i);
+        if (firstG < 0) firstG = baseY[i];
+        lastG = baseY[i];
+        segs.push(spineX, baseY[i], 0, -3.0, baseY[i], 0);
+      }
+    }
+    segs.push(spineX, firstG, 0, spineX, lastG, 0);
+    const spineGeo = track(new THREE.BufferGeometry());
+    spineGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(segs), 3));
+    const spineMat = track(new THREE.LineBasicMaterial({ color: new THREE.Color(C.spine), transparent: true, opacity: 0.55 }));
+    spineGrp.add(new THREE.LineSegments(spineGeo, spineMat));
+    const tapGeo = track(new THREE.SphereGeometry(0.16, 12, 10));
+    const tapMat = track(new THREE.MeshBasicMaterial({ color: new THREE.Color(C.spine) }));
+    const tapMesh = new THREE.InstancedMesh(tapGeo, tapMat, globalIdxs.length);
+    globalIdxs.forEach((gi, k) => { _m4.makeTranslation(spineX, baseY[gi], 0); tapMesh.setMatrixAt(k, _m4); });
+    tapMesh.instanceMatrix.needsUpdate = true;
+    spineGrp.add(tapMesh);
+    const spineMidY = (firstG + lastG) / 2;
+    const gridGrp = new THREE.Group(); gridGrp.visible = false; scene.add(gridGrp);
+    const exGeo = track(new THREE.BoxGeometry(0.30, 0.30, 0.30));
+    const exMat = track(new THREE.MeshPhongMaterial({ transparent: true, opacity: 0, shininess: 70 }));
+    const expertMesh = new THREE.InstancedMesh(exGeo, exMat, CFG.moe.experts);
+    expertMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    const GRID_X0 = 9.2, GRID_SP = 0.46, GRID_COLS = 16;
+    const basePos = new Float32Array(CFG.moe.experts * 3);
+    const colDim = new THREE.Color("#2E4224"), colOn = new THREE.Color(C.moe);
+    for (let e = 0; e < CFG.moe.experts; e++) {
+      const cxl = GRID_X0 + (e % GRID_COLS) * GRID_SP;
+      const cyl = (((e / GRID_COLS) | 0) - 3.5) * GRID_SP;
+      basePos[e * 3] = cxl; basePos[e * 3 + 1] = cyl; basePos[e * 3 + 2] = 0;
+      _m4.makeTranslation(cxl, cyl, 0);
+      expertMesh.setMatrixAt(e, _m4);
+      expertMesh.setColorAt(e, colDim);
+    }
+    expertMesh.instanceMatrix.needsUpdate = true;
+    if (expertMesh.instanceColor) expertMesh.instanceColor.needsUpdate = true;
+    gridGrp.add(expertMesh);
+    const shMesh = new THREE.Mesh(
+      track(new THREE.BoxGeometry(0.52, 0.52, 0.52)),
+      track(new THREE.MeshPhongMaterial({ color: new THREE.Color(C.shexp), transparent: true, opacity: 0, emissive: new THREE.Color(C.shexp), emissiveIntensity: 0.25 })));
+    shMesh.position.set(7.4, -2.6, 0);
+    gridGrp.add(shMesh);
+    const BEAMS = CFG.moe.topk + 1;
+    const beamGeo = track(new THREE.BufferGeometry());
+    beamGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(BEAMS * 6), 3));
+    const beamMat = track(new THREE.LineBasicMaterial({ color: new THREE.Color(C.router), transparent: true, opacity: 0 }));
+    gridGrp.add(new THREE.LineSegments(beamGeo, beamMat));
+    let gridTarget = -1, activeIdx = [], gsCur = 1, shCur = 1;
+    const activeSet = new Uint8Array(CFG.moe.experts);
+    function pickExperts(seed) {
+      const set = new Set(); let s = ((seed + 7) * 2654435761) >>> 0;
+      while (set.size < CFG.moe.topk) { s = (s * 1664525 + 1013904223) >>> 0; set.add(s % CFG.moe.experts); }
+      return [...set];
+    }
+    const archeCache = new Map();
+    let activeArche = null;
+    function shapeBox(w) {
+      const maxD = Math.max(w.rows, w.cols, 1);
+      const ps = Math.max(0.12, Math.min(1.0, Math.sqrt(w.pM) / 22));
+      return {
+        bw: (0.45 + ps * 1.5) * Math.max(0.18, w.cols / maxD),
+        bd: (0.45 + ps * 1.5) * Math.max(0.18, w.rows / maxD),
+        bh: 0.05 + ps * 0.16,
+      };
+    }
+    function buildArche(arche) {
+      if (archeCache.has(arche)) return archeCache.get(arche);
+      const ws = weightsFor(arche);
+      const g = new THREE.Group(); g.visible = false; g.userData = { arche };
+      const cols = Math.ceil(Math.sqrt(ws.length)), spacing = 2.6;
+      let vy = 0; const totalH = ws.reduce((a, w) => a + shapeBox(w).bh + 0.34, 0);
+      ws.forEach((w, i) => {
+        const { bw, bd, bh } = shapeBox(w);
+        const r = Math.floor(i / cols), c = i % cols;
+        const fx = (c - (cols - 1) / 2) * spacing;
+        const fz = (r - Math.floor(ws.length / cols) / 2) * spacing;
+        const geo = track(new THREE.BoxGeometry(bw, bh, bd));
+        const mat = track(new THREE.MeshPhongMaterial({ color: new THREE.Color(w.color), transparent: true, opacity: 0, shininess: 60 }));
+        const mesh = new THREE.Mesh(geo, mat);
+        const eGeo = track(new THREE.EdgesGeometry(geo));
+        const eMat = track(new THREE.LineBasicMaterial({ color: new THREE.Color(w.color), transparent: true, opacity: 0 }));
+        mesh.add(new THREE.LineSegments(eGeo, eMat));
+        const short = w.n.replace(/\s+\(.*\)/, "").replace(".weight", "")
+          .replace("backbone.", "").replace("mixer.", "").replace("mtp.", "")
+          + (w.count > 1 ? " ×" + w.count : "");
+        mesh.userData = { w, fx, fz, vy: vy - totalH / 2 + bh / 2, bh, eMat, short,
+          fpScale: Math.cbrt(bytesFor(w, "nvfp4") / BF16_BYTES) };
+        vy += bh + 0.34; g.add(mesh);
+      });
+      scene.add(g); archeCache.set(arche, g); return g;
+    }
+    const ray = new THREE.Raycaster(); const mouse = new THREE.Vector2(-99, -99);
+    function onResize() {
+      Wd = el.clientWidth; Hd = el.clientHeight;
+      camera.aspect = Wd / Hd; camera.updateProjectionMatrix(); renderer.setSize(Wd, Hd);
+    }
+    window.addEventListener("resize", onResize);
+    const ro = ("ResizeObserver" in window) ? new ResizeObserver(onResize) : null;
+    if (ro) ro.observe(el);
+    let raf = 0, lastT = performance.now();
+    function frame(now) {
+      raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now; st.time += dt;
+      const pulse = st.reduceMotion ? 0 : 1;
+      st.theta = slerp(st.theta, st.tTheta, 0.12); st.phi = slerp(st.phi, st.tPhi, 0.12);
+      st.dist = slerp(st.dist, st.tDist, 0.12);
+      st.panX = slerp(st.panX, st.tPanX, 0.14); st.panY = slerp(st.panY, st.tPanY, 0.14); st.panZ = slerp(st.panZ, st.tPanZ, 0.14);
+      const target = st.selected;
+      const focusY = target >= 0 ? baseY[target] : stackH * 0.46;
+      if (st.tCenterY === null) st.tCenterY = focusY;
+      st.tCenterY = slerp(st.tCenterY, focusY, 0.07);
+      if (target >= 0 && st.tDist > 40) st.tDist += (30 - st.tDist) * 0.02;
+      const cy = st.tCenterY + st.panY, lx = st.panX, lz = st.panZ;
+      camera.position.set(
+        lx + st.dist * Math.sin(st.phi) * Math.sin(st.theta),
+        cy + st.dist * Math.cos(st.phi),
+        lz + st.dist * Math.sin(st.phi) * Math.cos(st.theta));
+      camera.lookAt(lx, cy, lz);
+      if (!st.dragging || st.pendingTap) {
+        mouse.x = st.mx; mouse.y = st.my; ray.setFromCamera(mouse, camera);
+        let sub = null, subId = -1;
+        if (activeArche && activeArche.visible) {
+          const hh = ray.intersectObjects(activeArche.children, false);
+          if (hh.length && hh[0].object.userData.w) { sub = hh[0].object.userData.w; subId = activeArche.children.indexOf(hh[0].object); }
+        }
+        if (!sub) {
+          for (let i = 0; i < proxies.length; i++) proxies[i].visible = proxies[i].userData.li !== target;
+          const hh = ray.intersectObjects(proxies, false);
+          const nh = hh.length ? hh[0].object.userData.li : -1;
+          if (nh !== st.hovered) { st.hovered = nh; setHovUI(nh); }
+          st.hovSpine = -1;
+          if (st.showSpine && st.hovered < 0) {
+            const sh = ray.intersectObject(tapMesh, false);
+            if (sh.length) st.hovSpine = sh[0].instanceId;
+          }
+        } else { st.hovSpine = -1; if (st.hovered !== -1) { st.hovered = -1; setHovUI(-1); } }
+        const cn = sub ? sub.n : null;
+        if (cn !== st._lastCompN) { st._lastCompN = cn; setCompUI(sub); }
+        st.hovSubId = subId;
+        if (st.pendingTap) {
+          st.pendingTap = false;
+          if (subId < 0) { if (st.hovered >= 0) { st.selected = st.selected === st.hovered ? -1 : st.hovered; } else { st.selected = -1; } selectCb.current(st.selected); }
+        }
+      }
+      for (let i = 0; i < LAYERS.length; i++) {
+        st.expand[i] = slerp(st.expand[i], i === target ? 1 : 0, 0.1);
+        if (st.expand[i] < 0.002) st.expand[i] = 0;
+      }
+      const stackTarget = target >= 0 && target < STACK_N;
+      for (let i = 0; i < meshes.length; i++) {
+        const m = meshes[i], ud = m.userData;
+        let off = 0;
+        if (stackTarget && i < STACK_N) off = i < target ? -st.expand[target] * SPREAD * 0.5 : i > target ? st.expand[target] * SPREAD * 0.5 : 0;
+        m.position.y = slerp(m.position.y, ud.baseY + off, LERP);
+        const isT = i === target;
+        const tOp = isT ? Math.max(0, 0.82 - st.expand[i] * 0.82) : 0.82;
+        m.material.opacity = slerp(m.material.opacity, tOp, 0.15);
+        const pss = precRef.current === "nvfp4" ? ud.fpXZ : 1;
+        m.scale.x = slerp(m.scale.x, pss, 0.1); m.scale.z = m.scale.x;
+        const baseEmiss = LAYERS[i].t === "attn" ? 0.16 : (LAYERS[i].t === "mtp" ? 0.10 : 0);
+        if ((i === st.hovered || i === st.selected) && (!isT || st.expand[i] < 0.3)) {
+          m.material.emissive.set(ud.col); m.material.emissiveIntensity = 0.2 * (1 - st.expand[i]) + baseEmiss;
+        } else { m.material.emissive.set(ud.col); m.material.emissiveIntensity = baseEmiss; }
+      }
+      for (let i = 0; i < proxies.length; i++) {
+        const li = proxies[i].userData.li;
+        if (li < STACK_N) proxies[i].position.y = meshes[li].position.y;
+      }
+      poolN = 0;
+      const expandable = target >= 0 && weightsFor(LAYERS[target].arche).length > 0;
+      if (expandable && st.expand[target] > 0.01) {
+        const arche = LAYERS[target].arche;
+        let ag = activeArche;
+        if (!ag || ag.userData.arche !== arche) {
+          if (ag) ag.visible = false;
+          ag = buildArche(arche); ag.visible = true; activeArche = ag;
+        }
+        const cX = meshes[target].userData.baseX, cZ = meshes[target].userData.baseZ;
+        const cYm = meshes[target].position.y, prog = st.expand[target];
+        ag.position.set(cX, 0, cZ);
+        for (let ci = 0; ci < ag.children.length; ci++) {
+          const ch = ag.children[ci], cu = ch.userData;
+          const tx = st.floor ? cu.fx : 0, tz = st.floor ? cu.fz : 0, ty = cYm + (st.floor ? 0 : cu.vy);
+          ch.position.x = slerp(ch.position.x, tx, LERP);
+          ch.position.z = slerp(ch.position.z, tz, LERP);
+          ch.position.y = slerp(ch.position.y, ty, LERP);
+          const hov = ci === st.hovSubId;
+          ch.material.opacity = slerp(ch.material.opacity, prog * (hov ? 1 : 0.85), 0.15);
+          if (cu.eMat) cu.eMat.opacity = prog * (hov ? 0.6 : 0.25);
+          const sc = (hov ? 1.12 : 1) * (precRef.current === "nvfp4" ? cu.fpScale : 1);
+          ch.scale.x = slerp(ch.scale.x, sc, 0.12); ch.scale.y = ch.scale.x; ch.scale.z = ch.scale.x;
+          ch.material.emissive.set(cu.w.color); ch.material.emissiveIntensity = hov ? 0.22 : 0;
+          if (prog > 0.35) pushLabel(
+            cX + ch.position.x,
+            ch.position.y + (cu.bh / 2) * ch.scale.y + 0.05, cZ + ch.position.z,
+            cu.short, hov ? cu.w.s + " · " + fP(cu.w.pM) : cu.w.s,
+            hov ? "#FFFFFF" : cu.w.color, prog * (hov ? 1 : 0.72), st.floor ? "center" : "left");
+        }
+      } else if (activeArche && activeArche.visible) {
+        let done = true;
+        for (let ci = 0; ci < activeArche.children.length; ci++) {
+          const ch = activeArche.children[ci];
+          ch.material.opacity = slerp(ch.material.opacity, 0, 0.2);
+          if (ch.userData.eMat) ch.userData.eMat.opacity = ch.material.opacity * 0.25;
+          if (ch.material.opacity > 0.01) done = false;
+        }
+        if (done) { activeArche.visible = false; activeArche = null; }
+      }
+      const moeTarget = target >= 0 && (LAYERS[target].t === "moe" || LAYERS[target].t === "mtp") ? target : -1;
+      if (moeTarget !== gridTarget) {
+        gridTarget = moeTarget;
+        if (moeTarget >= 0) {
+          activeIdx = pickExperts(moeTarget);
+          activeSet.fill(0);
+          for (let j = 0; j < activeIdx.length; j++) activeSet[activeIdx[j]] = 1;
+          for (let e = 0; e < CFG.moe.experts; e++) expertMesh.setColorAt(e, activeSet[e] ? colOn : colDim);
+          if (expertMesh.instanceColor) expertMesh.instanceColor.needsUpdate = true;
+          const bp = beamGeo.attributes.position.array; let k = 0;
+          for (let j = 0; j < activeIdx.length; j++) {
+            const ai = activeIdx[j];
+            bp[k++] = 4.0; bp[k++] = 0; bp[k++] = 0;
+            bp[k++] = basePos[ai * 3]; bp[k++] = basePos[ai * 3 + 1]; bp[k++] = basePos[ai * 3 + 2];
+          }
+          bp[k++] = 4.0; bp[k++] = 0; bp[k++] = 0;
+          bp[k++] = shMesh.position.x; bp[k++] = shMesh.position.y; bp[k++] = shMesh.position.z;
+          beamGeo.attributes.position.needsUpdate = true;
+        }
+      }
+      const ep2 = moeTarget >= 0 ? st.expand[moeTarget] : 0;
+      gridGrp.visible = ep2 > 0.01;
+      if (gridGrp.visible) {
+        gridGrp.position.y = meshes[moeTarget].position.y;
+        exMat.opacity = ep2 * 0.95;
+        shMesh.material.opacity = ep2 * 0.95;
+        beamMat.opacity = ep2 * 0.38;
+        const quantHere = LAYERS[moeTarget].t !== "mtp";
+        const gsT = (precRef.current === "nvfp4" && quantHere) ? Math.cbrt(NVFP4_BYTES / BF16_BYTES) : 1;
+        gsCur = slerp(gsCur, gsT, 0.1);
+        shCur = slerp(shCur, gsT, 0.1);
+        shMesh.scale.setScalar(shCur);
+        for (let e = 0; e < CFG.moe.experts; e++) {
+          const s = gsCur * (activeSet[e] ? 1.55 + 0.28 * pulse * Math.sin(st.time * 3 + e * 0.37) : 1);
+          _s.set(s, s, s); _q.identity();
+          _v.set(basePos[e * 3], basePos[e * 3 + 1], basePos[e * 3 + 2]);
+          _m4.compose(_v, _q, _s); expertMesh.setMatrixAt(e, _m4);
+        }
+        expertMesh.instanceMatrix.needsUpdate = true;
+        if (ep2 > 0.35) {
+          pushLabel(GRID_X0 + 7.5 * GRID_SP, gridGrp.position.y + 2.6, 0,
+            "MIXTURE OF EXPERTS · 128", "router fires the top-6 per token · " + fP(MOE_LAYER_ACT) + " of " + fP(MOE_LAYER_P) + " used",
+            C.moe, ep2 * 0.9, "center");
+          pushLabel(shMesh.position.x, gridGrp.position.y + shMesh.position.y - 0.55, 0,
+            "shared expert", "always on · 2× width · " + (LAYERS[moeTarget].t === "mtp" ? "BF16 (mtp ignored)" : "NVFP4 too"), C.shexp, ep2 * 0.8, "center");
+        }
+      }
+      spineGrp.visible = st.showSpine;
+      if (st.showSpine) {
+        spineMat.opacity = slerp(spineMat.opacity, 0.55, 0.1);
+        const selG = target >= 0 && target < STACK_N && LAYERS[target].t === "attn" ? target : -1;
+        for (let k = 0; k < globalIdxs.length; k++) {
+          const gi = globalIdxs[k];
+          const isSel = gi === selG;
+          const s = (isSel ? 1.9 : 1.0) * (0.85 + 0.15 * pulse * Math.sin(st.time * 3 + k));
+          _s.set(s, s, s); _q.identity(); _v.set(spineX, meshes[gi].position.y, 0);
+          _m4.compose(_v, _q, _s); tapMesh.setMatrixAt(k, _m4);
+        }
+        tapMesh.instanceMatrix.needsUpdate = true;
+        pushLabel(spineX - 0.5, spineMidY, 0, "ATTENTION SPINE", "6 layers · every ~7th · the only KV cache", C.spine, 0.9, "right");
+      }
+      if (st.showLabels) {
+        for (let i = 0; i < STACK_N; i++) {
+          if (i === target) continue;
+          const ud = meshes[i].userData;
+          pushLabel(ud.baseX + ud.w / 2 + 0.35, meshes[i].position.y, ud.baseZ, fP(LAYERS[i].tp), "", "#D6E2CE", 0.62, "left");
+        }
+      }
+      commitLabels();
+      if (tipEl) {
+        let tk = "", tTitle = "", tColor = "#FFFFFF", tMeta = "", tBody = "";
+        if (!st.dragging && st.mxPx > -500) {
+          const px = precRef.current;
+          if (st.hovSubId >= 0 && activeArche && activeArche.visible) {
+            const ch = activeArche.children[st.hovSubId];
+            if (ch && ch.userData.w) {
+              const wgt = ch.userData.w;
+              if (st.explain) {
+                const ex = explainWeight(wgt);
+                tk = "w:" + wgt.n + px; tTitle = ex.t; tBody = ex.b; tColor = wgt.color;
+                tMeta = wgt.n + " · " + wgt.s + " · " + fP(wgt.pM) + " · " + wgt.dt(px);
+              }
+            }
+          } else if (st.hovSpine >= 0 && st.explain) {
+            const gi = globalIdxs[st.hovSpine];
+            tk = "sp:" + st.hovSpine; tTitle = EXPLAIN.spine.t; tBody = EXPLAIN.spine.b; tColor = C.spine;
+            tMeta = "tap " + (st.hovSpine + 1) + " of 6 → " + LAYERS[gi].label;
+          } else if (st.hovered >= 0 && st.hovered !== st.selected) {
+            const Lh = LAYERS[st.hovered];
+            tColor = layerColor(Lh);
+            tMeta = fP(Lh.tp) + " params · click to expand";
+            if (st.explain) {
+              const ex = explainLayer(Lh);
+              tk = "L:" + st.hovered + "x"; tTitle = Lh.label; tBody = ex.b;
+            } else {
+              tk = "L:" + st.hovered; tTitle = Lh.label;
+            }
+          }
+        }
+        if (tk) {
+          if (st._lastTip !== tk) {
+            st._lastTip = tk;
+            tipEl.querySelector(".tip-name").textContent = tTitle;
+            tipEl.querySelector(".tip-name").style.color = tColor;
+            tipEl.querySelector(".tip-sub").textContent = tMeta;
+            const bEl = tipEl.querySelector(".tip-body");
+            bEl.textContent = tBody; bEl.style.display = tBody ? "block" : "none";
+            tipEl.classList.toggle("big", !!tBody);
+          }
+          const tw = tBody ? 356 : 250;
+          const tx = clamp(st.mxPx + 16, 8, Wd - tw), ty = clamp(st.myPx + 14, 8, Math.max(8, Hd - (tBody ? 260 : 64)));
+          tipEl.style.transform = `translate3d(${tx}px,${ty}px,0)`;
+          tipEl.style.opacity = "1";
+        } else { tipEl.style.opacity = "0"; st._lastTip = ""; }
+      }
+      renderer.render(scene, camera);
+    }
+    raf = requestAnimationFrame(frame);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("resize", onResize);
+      if (ro) ro.disconnect();
+      disposables.forEach((o) => { if (o && o.dispose) o.dispose(); });
+      tapMesh.dispose(); expertMesh.dispose();
+      renderer.dispose();
+      if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement);
+      overlayEl.innerHTML = "";
+    };
+  }, []);
+  useEffect(() => {
+    function onKey(e) {
+      if (e.target && /input|textarea|select/i.test(e.target.tagName || "")) return;
+      const pan = st.tDist * 0.06;
+      if (e.key === "ArrowDown") { e.preventDefault(); st.selected = Math.min(LAYERS.length - 1, (st.selected < 0 ? -1 : st.selected) + 1); selectCb.current(st.selected); }
+      if (e.key === "ArrowUp") { e.preventDefault(); st.selected = Math.max(0, (st.selected < 0 ? 1 : st.selected) - 1); selectCb.current(st.selected); }
+      if (e.key === "Escape") { st.selected = -1; selectCb.current(-1); }
+      if (e.key === "w") st.tPanY += pan * 0.6;
+      if (e.key === "s" && !e.ctrlKey) st.tPanY -= pan * 0.6;
+      if (e.key === "a") { st.tPanX -= pan * Math.cos(st.tTheta); st.tPanZ += pan * Math.sin(st.tTheta); }
+      if (e.key === "d") { st.tPanX += pan * Math.cos(st.tTheta); st.tPanZ -= pan * Math.sin(st.tTheta); }
+      if (e.key === "r" || e.key === "R") { st.tPanX = st.tPanY = st.tPanZ = 0; st.tDist = 62; st.selected = -1; selectCb.current(-1); }
+      if (e.key === "L") togLbl();
+      if (e.key === "B") togSpine();
+      if (e.key === "f" || e.key === "F") togFloor();
+      if (e.key === "e" || e.key === "E") togExplain();
+      if (e.key === "p" || e.key === "P") cycPrec();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  const setMouseNorm = (clientX, clientY) => {
+    const el = mountRef.current; if (!el) return;
+    const r = el.getBoundingClientRect();
+    st.mxPx = clientX - r.left; st.myPx = clientY - r.top;
+    st.mx = (st.mxPx / r.width) * 2 - 1;
+    st.my = -(st.myPx / r.height) * 2 + 1;
+  };
+  const isCanvas = (e) => e.target && e.target.tagName === "CANVAS";
+  const onDown = useCallback((e) => {
+    if (!isCanvas(e)) return;
+    st.dragging = true; st.panDrag = (e.button === 1 || e.button === 2 || e.shiftKey);
+    st.dx0 = e.clientX; st.dy0 = e.clientY; st.moved = false;
+    if (st.panDrag) e.preventDefault();
+  }, []);
+  const onMove = useCallback((e) => {
+    if (!isCanvas(e) && !st.dragging) { st.mx = -99; st.my = -99; st.mxPx = -999; return; }
+    setMouseNorm(e.clientX, e.clientY);
+    if (st.dragging) {
+      const dx = e.clientX - st.dx0, dy = e.clientY - st.dy0;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) st.moved = true;
+      if (st.panDrag) {
+        const k = st.tDist * 0.0016;
+        st.tPanX -= (dx * Math.cos(st.tTheta)) * k; st.tPanZ += (dx * Math.sin(st.tTheta)) * k;
+        st.tPanY += dy * k;
+      } else {
+        st.tTheta += dx * 0.005; st.tPhi = Math.max(0.2, Math.min(2.9, st.tPhi - dy * 0.005));
+      }
+      st.dx0 = e.clientX; st.dy0 = e.clientY;
+    }
+  }, []);
+  const onUp = useCallback(() => {
+    if (st.dragging && !st.moved && !st.panDrag) st.pendingTap = true;
+    st.dragging = false; st.panDrag = false;
+  }, []);
+  const onLeave = useCallback(() => { st.mx = -99; st.my = -99; st.mxPx = -999; st.dragging = false; st.panDrag = false; }, []);
+  const onWheel = useCallback((e) => { st.tDist = clamp(st.tDist + e.deltaY * 0.04, 5, 220); }, []);
+  const onCtx = useCallback((e) => e.preventDefault(), []);
+  const onDbl = useCallback(() => { st.tPanX = st.tPanY = st.tPanZ = 0; st.tDist = window.innerWidth < 560 ? 96 : 56; }, []);
+  const tDist2 = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  const onTS = useCallback((e) => {
+    if (!isCanvas(e)) return;
+    const t = e.touches;
+    if (t.length === 1) {
+      st.dragging = true; st.pinch = false; st.moved = false; st.tapT = performance.now();
+      st.dx0 = t[0].clientX; st.dy0 = t[0].clientY;
+      setMouseNorm(t[0].clientX, t[0].clientY);
+    } else if (t.length === 2) {
+      st.dragging = true; st.pinch = true; st.moved = true;
+      st.pDist = tDist2(t);
+      st.pMidX = (t[0].clientX + t[1].clientX) / 2; st.pMidY = (t[0].clientY + t[1].clientY) / 2;
+    }
+  }, []);
+  const onTM = useCallback((e) => {
+    const t = e.touches;
+    if (st.pinch && t.length === 2) {
+      const nd = tDist2(t);
+      if (nd > 0 && st.pDist > 0) st.tDist = clamp(st.tDist * (st.pDist / nd), 5, 220);
+      st.pDist = nd;
+      const mx = (t[0].clientX + t[1].clientX) / 2, my = (t[0].clientY + t[1].clientY) / 2;
+      const k = st.tDist * 0.0016;
+      st.tPanX -= ((mx - st.pMidX) * Math.cos(st.tTheta)) * k; st.tPanZ += ((mx - st.pMidX) * Math.sin(st.tTheta)) * k;
+      st.tPanY += (my - st.pMidY) * k;
+      st.pMidX = mx; st.pMidY = my;
+    } else if (t.length === 1 && st.dragging && !st.pinch) {
+      const dx = t[0].clientX - st.dx0, dy = t[0].clientY - st.dy0;
+      if (Math.abs(dx) > 6 || Math.abs(dy) > 6) st.moved = true;
+      st.tTheta += dx * 0.006; st.tPhi = Math.max(0.2, Math.min(2.9, st.tPhi - dy * 0.006));
+      st.dx0 = t[0].clientX; st.dy0 = t[0].clientY;
+      setMouseNorm(t[0].clientX, t[0].clientY);
+    }
+  }, []);
+  const onTE = useCallback((e) => {
+    if (e.touches.length === 0) {
+      if (!st.pinch && !st.moved && performance.now() - st.tapT < 350) st.pendingTap = true;
+      st.dragging = false; st.pinch = false;
+    } else if (e.touches.length === 1) {
+      st.pinch = false; st.dx0 = e.touches[0].clientX; st.dy0 = e.touches[0].clientY; st.moved = true;
+    }
+  }, []);
+  function togExplain() { st.explain = !st.explain; setExUI(st.explain); }
+  function togLbl() { st.showLabels = !st.showLabels; setLblUI(st.showLabels); }
+  function togSpine() { st.showSpine = !st.showSpine; setSpineUI(st.showSpine); }
+  function togFloor() { st.floor = !st.floor; setFloorUI(st.floor); }
+  function cycPrec() { setPrec((p) => p === "bf16" ? "nvfp4" : "bf16"); }
+  const navLayer = (d) => {
+    st.selected = clamp((st.selected < 0 ? (d > 0 ? -1 : 1) : st.selected) + d, 0, LAYERS.length - 1);
+    selectCb.current(st.selected);
+  };
+  const L = selUI >= 0 ? LAYERS[selUI] : null;
+  const ws = L ? weightsFor(L.arche).filter((w) => filters.norms || w.cat !== "norm") : [];
+  const layerVramGB = L ? vramMB(weightsFor(L.arche), prec) / 1000 : 0;
+  const layerActM = L ? (L.t === "moe" || L.t === "mtp" ? actMB(weightsFor(L.arche)) : L.tp) : 0;
+  const dtColor = (dtv) => dtv === "NVFP4" ? C.moe : dtv === "FP8" ? C.mamba : "#8CA9FF";
+  const inspector = html`<div>
+    ${!L && html`<${Overview} prec=${prec} />`}
+    ${L && html`<div>
+      <${Sec} t="Summary">
+        <${Row} l="Total params" v=${fP(L.tp)} />
+        ${(L.t === "moe" || L.t === "mtp") && html`<${Row} l="Active per token" v=${fP(layerActM) + " · " + (layerActM / L.tp * 100).toFixed(1) + "%"} />`}
+        <${Row} l="Archetype" v=${L.arche} />
+        <${Row} l=${"Size · " + PREC[prec].label.split(" · ")[0]} v=${fmtGB(layerVramGB)} />
+      <//>
+      ${exUI && html`<${Sec} t="What is this?">
+        <${Note} c=${layerColor(L)}>
+          <b style=${{ color: layerColor(L), fontStyle: "normal" }}>${explainLayer(L).t}.</b> ${explainLayer(L).b}
+        <//>
+      <//>`}
+      ${L.t === "mamba" && html`<${Sec} t="Mamba-2 mixer · spec">
+        <${Row} l="Type" v="SSD recurrence · O(1)/token" />
+        <${Row} l="Heads" v=${CFG.mamba.heads + " × " + CFG.mamba.headDim} />
+        <${Row} l="State / head" v=${CFG.mamba.headDim + " × " + CFG.mamba.state + " · F32"} />
+        <${Row} l="B/C groups" v=${CFG.mamba.groups + " × " + CFG.mamba.state} />
+        <${Row} l="Conv" v="kernel 4 · depthwise + bias" />
+        <${Row} l="Δt" v="floor 1e-4 · [1e-3, 0.1]" />
+        <${Row} l="Chunk" v=${CFG.mamba.chunk} />
+        <${Row} l="Layer state" v="~2.2 MB · constant" />
+        <${Note} c=${C.mamba}>
+          No KV cache ever. A fixed 64 × (64×128) F32 state absorbs the sequence — the same ~2.2 MB whether the context holds 10 tokens or 1,048,576. 23 of 52 layers work this way. In the NVFP4 repo the two big projections here run FP8 weights AND activations; everything else stays BF16.
+        <//>
+      <//>`}
+      ${L.t === "attn" && html`<${Sec} t="Attention · spec">
+        <${Row} l="Type" v="softmax · full window" />
+        <${Row} l="Q heads" v=${CFG.heads + " × " + CFG.headDim} />
+        <${Row} l="KV heads (GQA)" v=${CFG.kv + " × " + CFG.headDim + " · " + (CFG.heads / CFG.kv) + "×"} />
+        <${Row} l="Rotary" v="full head · θ = 10 000" />
+        <${Row} l="Bias / QK-norm" v="none / none" />
+        <${Row} l="KV / token" v="1 KB BF16 · 0.5 KB FP8" />
+        <${Row} l="Kin" v="1 of only 6 attention layers" />
+        <${Note} c=${C.attn}>
+          One of SIX layers that attend the whole window — the model's entire random-access memory, and the only KV-cache rent: ~${KV_256K.toFixed(1)} GB at 256K, ~${KV_1M.toFixed(1)} GB at 1M across all six (halved by the FP8 KV scheme). Every projection here sits in the quantizer's ignore list — attention stays BF16 in both repos.
+        <//>
+      <//>`}
+      ${(L.t === "moe" || L.t === "mtp") && html`<${Sec} t="Mixture of Experts · spec">
+        <${Row} l="Routed experts" v=${CFG.moe.experts + " × relu² 2688→1856"} />
+        <${Row} l="Per expert" v=${fP(EXPERT_P) + " · 2 matrices, no gate"} />
+        <${Row} l="Active" v=${CFG.moe.topk + " routed + 1 shared"} />
+        <${Row} l="Router" v="2688 → 128 · top-6 · norm · ×2.5" />
+        <${Row} l="Shared expert" v=${"always on · width " + grp(CFG.moe.sharedInter)} />
+        <${Row} l="Activated / token" v=${fP(MOE_LAYER_ACT) + " of " + fP(MOE_LAYER_P) + " · " + (MOE_LAYER_ACT / MOE_LAYER_P * 100).toFixed(1) + "%"} />
+        <${Note} c=${C.moe}>${EXPLAIN.nh_moe.b}<//>
+      <//>`}
+      ${html`<${Sec} t=${"Weights · " + ws.length}
+        right=${html`<${FBtn} on=${filters.norms} onClick=${() => setFilters((f) => ({ norms: !f.norms }))} label="norms" c=${C.norm} />`}>
+        ${ws.map((w, i) => {
+          const isHov = compUI && compUI.n === w.n;
+          const dtv = w.dt(prec);
+          const dtC = dtColor(dtv);
+          const wBytes = w.pM * bytesFor(w, prec);
+          return html`<div key=${i} class="wrow" style=${{ background: isHov ? "#FFFFFF0d" : "transparent" }}>
+            <span class="wdot" style=${{ background: w.color }} />
+            <span style=${{ flex: 1, minWidth: 0 }}>
+              <span class="wname" style=${{ color: isHov ? "#fff" : T.paper }}>${w.n}</span>
+              <span class="wshape">${w.s}<i class="wtag" style=${{ color: dtC, borderColor: dtC + "55" }}>${dtv}</i></span>
+            </span>
+            <span style=${{ textAlign: "right", flexShrink: 0 }}>
+              <span class="wp" style=${{ color: "#8CA9FF" }}>${fP(w.pM)}</span>
+              <span class="wb">${wBytes < 1000 ? wBytes.toFixed(1) + " MB" : (wBytes / 1000).toFixed(2) + " GB"}</span>
+            </span>
+          </div>`;
+        })}
+      <//>`}
+      ${compUI && html`<${Sec} t="Focused tensor">
+        <div style=${{ background: "#FFFFFF08", borderRadius: 8, padding: 10, border: "1px solid " + T.line }}>
+          <div style=${{ fontSize: 13, fontWeight: 700, color: "#fff", marginBottom: 6, fontFamily: T.mono, wordBreak: "break-all" }}>${compUI.n}</div>
+          <${Row} l="Shape" v=${compUI.s} />
+          <${Row} l="Dtype" v=${compUI.dt(prec)} />
+          <${Row} l="Params" v=${fP(compUI.pM)} />
+          <${Row} l="Size" v=${(() => { const b = compUI.pM * bytesFor(compUI, prec); return b < 1000 ? b.toFixed(1) + " MB" : (b / 1000).toFixed(2) + " GB"; })()} />
+          ${exUI && html`<div style=${{ marginTop: 8, fontSize: 12, color: T.mut, lineHeight: 1.65 }}>
+            <b style=${{ color: compUI.color }}>${explainWeight(compUI).t}.</b> ${explainWeight(compUI).b}
+          </div>`}
+        </div>
+      <//>`}
+      ${html`<${Sec} t="Size by precision"><${VBar} arche=${L.arche} prec=${prec} /><//>`}
+    </div>`}
+  </div>`;
+  const legend = html`<div class="legend">
+    ${[["Mamba-2", C.mamba], ["Attention", C.attn], ["Routed experts", C.moe], ["Shared exp", C.shexp], ["Router", C.router], ["Norms", C.norm], ["Embed", C.embed], ["Head·MTP", C.head]].map((p) =>
+      html`<span key=${p[0]} class="legit"><i style=${{ background: p[1] }} />${p[0]}</span>`)}
+  </div>`;
+  const headerTitle = L
+    ? html`<span style=${{ fontFamily: T.serif, fontSize: 17, fontWeight: 600, color: "#fff", fontStyle: "italic", letterSpacing: 0.2 }}>
+        ${L.label.split(" · ")[0]}
+        <span style=${{ fontFamily: T.mono, fontStyle: "normal", fontSize: 11, color: T.mut, marginLeft: 8 }}>${L.label.split(" · ").slice(1).join(" · ")}</span>
+        ${L.t === "attn" && html`<span class="chip" style=${{ color: C.attn, borderColor: C.attn + "55" }}>◆ attention</span>`}
+        ${L.t === "mamba" && html`<span class="chip" style=${{ color: C.mamba, borderColor: C.mamba + "55" }}>○ Mamba-2</span>`}
+        ${L.t === "moe" && html`<span class="chip" style=${{ color: C.moe, borderColor: C.moe + "55" }}>▣ 128 experts</span>`}
+        ${L.t === "mtp" && html`<span class="chip" style=${{ color: C.mtp, borderColor: C.mtp + "55" }}>◈ speculative</span>`}
+      </span>`
+    : html`<span style=${{ fontFamily: T.serif, fontSize: 17, fontStyle: "italic", color: "#fff" }}>Model overview</span>`;
+  const navBtns = html`<span style=${{ display: "inline-flex", gap: 6 }}>
+    <button class="navb" aria-label="Previous layer" onClick=${(e) => { e.stopPropagation(); navLayer(-1); }}>↓</button>
+    <button class="navb" aria-label="Next layer" onClick=${(e) => { e.stopPropagation(); navLayer(1); }}>↑</button>
+    ${L && html`<button class="navb" aria-label="Clear selection" onClick=${(e) => { e.stopPropagation(); clearSelect(); }}>✕</button>`}
+  </span>`;
+  const settingRows = html`<div style=${{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
+    <${TBtn} on=${exUI} onClick=${togExplain} label="Explain on hover" k="E" c=${C.embed} />
+    <${TBtn} on=${spineUI} onClick=${togSpine} label="Attention spine" k="⇧B" c=${C.attn} />
+    <${TBtn} on=${lblUI} onClick=${togLbl} label="Param labels" k="⇧L" />
+    <${TBtn} on=${floorUI} onClick=${togFloor} label=${floorUI ? "Floor expand" : "Column expand"} k="F" />
+  </div>`;
+  return html`<div style=${{ width: "100vw", height: "100vh", display: "flex", background: T.bg, fontFamily: T.mono, color: T.paper, overflow: "hidden", position: "relative" }}>
+    <style>${CSS}</style>
+    ${!mobile && html`<div class="rail" role="listbox" aria-label="Layers">
+      <div class="rail-cap">MTP</div>
+      <div style=${{ flex: 1, display: "flex", flexDirection: "column-reverse", padding: "2px 5px" }}>
+        ${LAYERS.map((l, i) => {
+          const isA = i === selUI, isH = i === hovUI;
+          const cc = layerColor(l);
+          return html`<div key=${i} title=${l.label + " · " + fP(l.tp)}
+            onClick=${() => doSelect(i)}
+            class="rail-row"
+            style=${{
+              flex: (l.t === "mamba" || l.t === "attn" || l.t === "moe") ? "1 1 2px" : "0 0 6px",
+              background: isA ? cc : isH ? cc + "99" : cc + "3d",
+              boxShadow: l.t === "attn" ? "inset 3px 0 0 " + C.attn : "none",
+            }} />`;
+        })}
+      </div>
+      <div class="rail-cap">IN</div>
+    </div>`}
+    <div ref=${mountRef} class="stage"
+      onMouseDown=${onDown} onMouseMove=${onMove} onMouseUp=${onUp} onMouseLeave=${onLeave}
+      onWheel=${onWheel} onContextMenu=${onCtx} onDblClick=${onDbl}
+      onTouchStart=${onTS} onTouchMove=${onTM} onTouchEnd=${onTE}>
+      <div ref=${overlayRef} class="overlay" aria-hidden="true" />
+      <div ref=${tipRef} class="tip" aria-hidden="true">
+        <div class="tip-name" />
+        <div class="tip-sub" />
+        <div class="tip-body" />
+      </div>
+      <div class="hud brand">
+        <div class="brand-eyebrow">Architecture explorer</div>
+        <div class="brand-word">Nemotron 3.5 Lightning</div>
+        ${!mobile && html`<div>
+          <div class="brand-sub">NemotronH hybrid MoE · ${MAMBA_LAYERS} Mamba-2 + ${ATTN_LAYERS} attention + ${MOE_LAYERS} expert layers · 128 → top-6 + 1 shared</div>
+          <div class="brand-sub" style=${{ color: C.moe }}>◆ ${fP(TRUNK_P)} total · ${fP(ACT_TOTAL)} active/token · ctx 256K → 1M · +${fP(MTP_P)} MTP</div>
+        </div>`}
+      </div>
+      <div class="hud prec-wrap">
+        <div class="prec">
+          ${["bf16", "nvfp4"].map((p) => {
+            const on = prec === p;
+            return html`<button key=${p} onClick=${() => setPrec(p)} aria-pressed=${on}
+              style=${{ background: on ? PREC[p].c + "1f" : "transparent", color: on ? PREC[p].c : T.faint, borderRight: p === "bf16" ? "1px solid " + T.line : "none" }}>
+              ${PREC[p].label}<b>${VRAM[p].toFixed(1)} GB</b>
+            </button>`;
+          })}
+        </div>
+        ${!mobile && html`<div class="prec-repo" style=${{ color: PREC[prec].c }}>${PREC[prec].repo} · [P]</div>`}
+      </div>
+      <div class="hud controls">
+        ${mobile
+          ? html`<button class="iconb" aria-label="View settings" onClick=${() => setMenuOpen((v) => !v)}>⚙</button>`
+          : settingRows}
+        <button class="iconb" aria-label="Help" onClick=${() => setHelpOpen((v) => !v)}>?</button>
+      </div>
+      ${mobile && menuOpen && html`<div class="hud popover" style=${{ top: 92, right: 12 }}>${settingRows}</div>`}
+      ${helpOpen && html`<div class="hud popover" style=${{ top: mobile ? 92 : 56, right: mobile ? 52 : 12, maxWidth: 268 }}>
+        <div class="pop-h">Controls</div>
+        ${mobile ? html`<div class="pop-b">
+          drag — orbit<br />pinch — zoom · two-finger drag — pan<br />tap layer — expand · tap again — close<br />double-tap — reset view<br />opening a green layer lights its 128-expert grid<br />explanations appear in the sheet below
+        </div>` : html`<div class="pop-b">
+          drag — orbit · right-drag / WASD — pan<br />scroll — zoom · double-click / R — reset<br />click layer — expand tensors + expert grid<br />bright cubes = the 6 routed experts firing<br />volume ∝ bytes on disk — press P to flip NVFP4<br />↑ ↓ — walk layers · Esc — close · E — explain<br />⇧B spine · ⇧L labels · F expand mode
+        </div>`}
+      </div>`}
+      ${!mobile && html`<div class="hud stats">
+        <${Bdg} l="TOTAL (derived)" v=${fP(TRUNK_P)} c=${C.accent} />
+        <${Bdg} l="ACTIVE / TOKEN" v=${fP(ACT_TOTAL)} c=${C.mamba} />
+        <${Bdg} l="NVFP4 · MIXED" v=${VRAM.nvfp4.toFixed(1) + " GB"} c=${C.moe} />
+        <${Bdg} l="BF16" v=${VRAM.bf16.toFixed(1) + " GB"} c="#8CA9FF" />
+        <${Bdg} l="KV @256K · 6L" v=${KV_256K.toFixed(1) + " GB"} c=${C.attn} />
+      </div>`}
+    </div>
+    ${!mobile && html`<div class="side">
+      <div class="side-h">
+        <div>
+          <div class="eyebrow">${L ? "Inspector" : "Nemotron-3.5-Lightning-30B-A3B"}</div>
+          ${headerTitle}
+        </div>
+        ${navBtns}
+      </div>
+      <div class="side-body">${inspector}</div>
+      <div class="side-f">${legend}</div>
+    </div>`}
+    ${mobile && html`<div class=${"sheet" + (sheetOpen ? " open" : "")}>
+      <div class="sheet-h" onClick=${() => setSheetOpen((v) => !v)} role="button" aria-expanded=${sheetOpen}>
+        <div class="grab" />
+        <div style=${{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+          <div style=${{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            ${L ? headerTitle : html`<span style=${{ fontFamily: T.serif, fontStyle: "italic", fontSize: 16, color: "#fff" }}>
+              Nemotron 3.5 Lightning <span style=${{ fontFamily: T.mono, fontStyle: "normal", fontSize: 11, color: T.mut }}>${fP(TRUNK_P)} · ${fP(ACT_TOTAL)} act · 1M</span>
+            </span>`}
+          </div>
+          ${navBtns}
+        </div>
+      </div>
+      ${sheetOpen && html`<div class="sheet-body">${inspector}<div style=${{ height: 8 }} />${legend}</div>`}
+    </div>`}
+  </div>`;
+}
+function TBtn(p) {
+  const c = p.c || "#8CA9FF";
+  return html`<button onClick=${p.onClick} aria-pressed=${p.on} class="tbtn"
+    style=${{ background: p.on ? c + "1a" : "#FFFFFF08", borderColor: p.on ? c + "55" : T.line, color: p.on ? c : T.mut }}>
+    <span style=${{ width: 7, height: 7, borderRadius: 7, background: p.on ? c : "#37452F", flexShrink: 0 }} />
+    ${p.label}${p.k && html`<span style=${{ fontSize: 10, color: T.faint }}>${p.k}</span>`}
+  </button>`;
+}
+function FBtn(p) {
+  return html`<button onClick=${p.onClick} aria-pressed=${p.on} class="tbtn" style=${{ padding: "3px 9px", fontSize: 11, background: p.on ? p.c + "1a" : "#FFFFFF08", borderColor: p.on ? p.c + "55" : T.line, color: p.on ? p.c : T.faint }}>
+    <span style=${{ width: 6, height: 6, borderRadius: 6, background: p.on ? p.c : "#37452F" }} />${p.label}
+  </button>`;
+}
+function Bdg(p) {
+  return html`<div style=${{ background: p.c + "12", border: "1px solid " + p.c + "33", borderRadius: 8, padding: "7px 12px", backdropFilter: "blur(6px)" }}>
+    <div style=${{ fontSize: 10, letterSpacing: 1.6, color: p.c + "bb" }}>${p.l}</div>
+    <div style=${{ fontSize: 17, fontWeight: 700, color: p.c, marginTop: 1, fontVariantNumeric: "tabular-nums" }}>${p.v}</div>
+  </div>`;
+}
+function Sec(p) {
+  return html`<div style=${{ marginTop: 18 }}>
+    <div style=${{ display: "flex", alignItems: "baseline", justifyContent: "space-between", paddingBottom: 6, borderBottom: "1px solid " + T.line, marginBottom: 7 }}>
+      <span style=${{ fontFamily: T.serif, fontStyle: "italic", fontSize: 14.5, color: "#A9D65A", letterSpacing: 0.3 }}>${p.t}</span>
+      ${p.right || null}
+    </div>
+    ${p.children}
+  </div>`;
+}
+function Row(p) {
+  return html`<div style=${{ display: "flex", justifyContent: "space-between", gap: 12, padding: "4.5px 0", borderBottom: "1px solid #FFFFFF08" }}>
+    <span style=${{ fontSize: 12.5, color: T.mut }}>${p.l}</span>
+    <span style=${{ fontSize: 12.5, color: T.paper, fontWeight: 600, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>${p.v}</span>
+  </div>`;
+}
+function Note(p) {
+  return html`<div style=${{ marginTop: 8, fontSize: 12, color: T.mut, lineHeight: 1.65, background: p.c + "0d", border: "1px solid " + p.c + "26", borderRadius: 8, padding: "9px 11px" }}>${p.children}</div>`;
+}
+function PB(p) {
+  const pct = Math.max(0.4, (p.v / p.mx) * 100);
+  return html`<div style=${{ marginBottom: 8 }}>
+    <div style=${{ display: "flex", justifyContent: "space-between", fontSize: 11.5, marginBottom: 3 }}>
+      <span style=${{ color: T.mut }}>${p.l}</span><span style=${{ color: p.c, fontVariantNumeric: "tabular-nums" }}>${fP(p.v)}</span>
+    </div>
+    <div style=${{ height: 4, background: "#FFFFFF0a", borderRadius: 2 }}><div style=${{ width: pct + "%", height: "100%", background: p.c, borderRadius: 2 }} /></div>
+  </div>`;
+}
+function VBar(p) {
+  const bf = vramMB(weightsFor(p.arche), "bf16") / 1000, f4 = vramMB(weightsFor(p.arche), "nvfp4") / 1000, mx = bf;
+  const ratio = bf / f4;
+  return html`<div>${[{ n: "BF16", v: bf, c: "#8CA9FF", k: "bf16" }, { n: "NVFP4", v: f4, c: C.moe, k: "nvfp4" }].map((it) => {
+    const cur = p.prec === it.k;
+    const val = fmtGB(it.v);
+    return html`<div key=${it.k} style=${{ marginBottom: 8 }}>
+      <div style=${{ display: "flex", justifyContent: "space-between", fontSize: 11.5, marginBottom: 3 }}>
+        <span style=${{ color: cur ? it.c : T.faint, fontWeight: cur ? 700 : 400 }}>${it.n}${cur ? " ◂" : ""}</span>
+        <span style=${{ color: cur ? it.c : T.faint, fontVariantNumeric: "tabular-nums" }}>${val}</span>
+      </div>
+      <div style=${{ height: 4, background: "#FFFFFF08", borderRadius: 2 }}><div style=${{ width: Math.max(1, (it.v / mx) * 100) + "%", height: "100%", background: cur ? it.c : it.c + "40", borderRadius: 2 }} /></div>
+    </div>`;
+  })}
+    <div style=${{ fontSize: 11.5, color: T.mut, marginTop: 2 }}>${ratio > 2.5 ? ratio.toFixed(2) + "× smaller — 4-bit NVFP4 weights" : ratio > 1.01 ? ratio.toFixed(2) + "× smaller — FP8 projections" : "untouched by the NVFP4 repo — stays BF16"}</div>
+  </div>`;
+}
+function Overview(p) {
+  return html`<div>
+    <${Sec} t="One model, two forms">
+      <div style=${{ display: "flex", gap: 8, marginBottom: 8 }}>
+        ${["bf16", "nvfp4"].map((k) => {
+          const cur = p.prec === k;
+          return html`<div key=${k} style=${{ flex: 1, background: PREC[k].c + (cur ? "18" : "08"), border: "1px solid " + PREC[k].c + (cur ? "55" : "22"), borderRadius: 10, padding: 11 }}>
+            <div style=${{ fontSize: 12.5, fontWeight: 700, color: PREC[k].c }}>${PREC[k].label}</div>
+            <div style=${{ fontSize: 20, fontWeight: 700, color: "#fff", marginTop: 3, fontVariantNumeric: "tabular-nums" }}>${VRAM[k].toFixed(1)} GB</div>
+            <div style=${{ fontSize: 10.5, color: T.faint, marginTop: 4 }}>${PREC[k].repo}</div>
+          </div>`;
+        })}
+      </div>
+      <${Note} c=${C.moe}>${EXPLAIN.nvfp4.b}<//>
+    <//>
+    <${Sec} t="How a token flows">
+      <${Note} c=${C.accent}>
+        Looked up in a 352M-row embedding table, a token becomes a 2,688-dim vector riding a residual stream through 52 single-purpose blocks. Unlike the usual mixer-plus-FFN sandwich, every NemotronH block is ONE thing: a <b style=${{ color: C.mamba }}>Mamba-2 recurrence</b> (23 layers, constant state), a burst of <b style=${{ color: C.attn }}>full attention</b> (6 layers, the only KV cache), or a pure <b style=${{ color: C.moe }}>Mixture of Experts</b> (23 layers — top-6 of 128 plus a double-width shared expert). A final RMSNorm and an untied unembedding produce 131,072 logits, while the 1.3B MTP block above drafts the token after next. Of the 31.6B parameters, each token touches ~3.6B — about 11%.
+      <//>
+    <//>
+    <${Sec} t="Architecture">
+      <${Row} l="Derived total" v=${fP(TRUNK_P) + " (+" + fP(MTP_P) + " MTP)"} />
+      <${Row} l="On the tin" v="30B · A3B" />
+      <${Row} l="Derived active / token" v=${fP(ACT_TOTAL) + " · " + fP(ACT_NOEMB) + " excl. vocab"} />
+      <${Row} l="Layers" v="52 · 23 Mamba + 23 MoE + 6 attn" />
+      <${Row} l="Hidden" v="2 688" />
+      <${Row} l="Mamba heads" v="64 × 64 · state 128 · 8 groups" />
+      <${Row} l="Attn heads" v="32 Q / 2 KV × 128 · GQA 16:1" />
+      <${Row} l="Experts / layer" v="128 → top-6 + 1 shared" />
+      <${Row} l="Expert width" v="1 856 · relu² · no gate matrix" />
+      <${Row} l="Shared width" v="3 712 · = 2 experts" />
+      <${Row} l="Context" v="262 144 → 1 048 576" />
+      <${Row} l="Vocab" v="131 072 · untied" />
+      <${Note} c=${C.accent}>${EXPLAIN.recon.b}<//>
+    <//>
+    <${Sec} t="Hybrid rhythm · M · E · A">
+      <${Row} l="Mamba-2 layers" v=${MAMBA_LAYERS + " · SSD · O(1)/token"} />
+      <${Row} l="Attention layers" v=${ATTN_LAYERS + " · idx 5,12,19,26,33,42"} />
+      <${Row} l="MoE layers" v=${MOE_LAYERS + " · no sequence state"} />
+      <${Row} l="Mamba state" v=${"~" + MAMBA_STATE_MB.toFixed(0) + " MB · constant"} />
+      <${Row} l="KV / token" v="1 KB × 6 layers only" />
+      <${Row} l="KV cache @ 256K" v=${KV_256K.toFixed(1) + " GB"} />
+      <${Row} l="KV cache @ 1M" v=${KV_1M.toFixed(1) + " GB (vs " + KV_ALL52_1M.toFixed(1) + " if all 52 attended)"} />
+      <${Row} l="FP8 KV @ 1M" v=${KV_1M_FP8.toFixed(1) + " GB"} />
+      <${Note} c=${C.attn}>${EXPLAIN.spine.b}<//>
+    <//>
+    <${Sec} t="Mixture of Experts">
+      <${Row} l="Routed experts" v=${grp(CFG.moe.experts * MOE_LAYERS) + " model-wide"} />
+      <${Row} l="They hold" v=${fP(ROUTED_P) + " · " + (ROUTED_P / TRUNK_P * 100).toFixed(0) + "% of the model"} />
+      <${Row} l="Per layer" v=${fP(MOE_LAYER_P) + " · " + fP(MOE_LAYER_ACT) + " used/tok"} />
+      <${Row} l="Idle per token" v="122 of 129 expert slots" />
+      <${Note} c=${C.moe}>
+        Click any green layer to watch its routing: the grid lights the 6 experts the router picks (layer-seeded here for illustration — real routing is per-token), the citron cube is the always-on shared expert, and the beams are the router's top-k selection. This sparsity is the model's whole economic argument: 30B of knowledge at ~3B of compute — and since the 2,944 experts are ${(ROUTED_P / TRUNK_P * 100).toFixed(0)}% of the weights, they are also exactly where the NVFP4 repo spends its 4 bits.
+      <//>
+    <//>
+    <${Sec} t="MTP & speculative decoding">
+      <${Row} l="MTP module" v="1 attention + 1 MoE block" />
+      <${Row} l="MTP params" v=${fP(MTP_P)} />
+      <${Row} l="MTP precision" v="BF16 · 'mtp*' ignored by quantizer" />
+      <${Row} l="DSpark" v="semi-autoregressive block drafter" />
+      <${Row} l="DFlash" v="block-diffusion drafter" />
+      <${Note} c=${C.mtp}>${EXPLAIN.mtp.b}<//>
+    <//>
+    <${Sec} t="Reasoning & deployment — checked">
+      <${Row} l="Thinking" v="on / off · chat template" />
+      <${Row} l="Languages" v="EN + ES FR DE IT JA" />
+      <${Row} l="Sampling" v="T 1.0 · top-p 0.95" />
+      <${Row} l="1× H100 · BF16" v="256K validated · memory-bound" />
+      <${Row} l="1M window" v="8×H100 · GB200 · B200" />
+      <${Row} l="Pre-training" v="20T+ tokens · NVFP4 recipe" />
+      <${Row} l="License" v="OpenMDW-1.1 · commercial" />
+      <${Note} c=${C.embed}>
+        Reasoning is a switch, not a fixture: enable_thinking toggles it per request via the chat template. The BF16 release is explicitly the reference artifact — for post-training (SFT, RL, distillation), domain adaptation and rolling your own quants — while NVIDIA routes production inference to the NVFP4 release, which also carries the DSpark and DFlash drafters plus the DGX Spark recipe. Open weights, open data, open recipe: 20T+ pre-training tokens, and the pre-training itself ran in NVFP4.
+      <//>
+    <//>
+    <${Sec} t="The odd numbers">
+      <${Note} c=${C.attn}>${EXPLAIN.oddments.b}<//>
+    <//>
+    <${Sec} t="Context · 256K → 1M">
+      <${Note} c=${C.mamba}>${EXPLAIN.ctx.b}<//>
+    <//>
+    <${Sec} t="Distribution">
+      <${PB} l="2 944 routed experts" v=${ROUTED_P} mx=${TRUNK_P} c=${C.moe} />
+      <${PB} l="23 Mamba-2 blocks (whole)" v=${MAMBA_P} mx=${TRUNK_P} c=${C.mamba} />
+      <${PB} l="Embed + head" v=${EMBH_P} mx=${TRUNK_P} c=${C.embed} />
+      <${PB} l="23 shared experts" v=${SHEXP_P} mx=${TRUNK_P} c=${C.shexp} />
+      <${PB} l="6 attention blocks (whole)" v=${ATTN_P} mx=${TRUNK_P} c=${C.attn} />
+      <${PB} l="23 routers" v=${ROUTER_P} mx=${TRUNK_P} c=${C.router} />
+    <//>
+    <${Note} c=${C.accent}>
+      Click any slab to unfold it — a teal Mamba block opens into its 8 SSD tensors, an amber attention block into 5, and a green MoE block into 6 plus its 128-expert routing grid. ◆ left spine = the 6 attention layers, the model's only KV cache. The violet crown above the head is the 1.3B MTP block; the base slab is the token embedding. Box volume tracks bytes on disk — press P and watch the green mass shrink.
+    <//>
+  </div>`;
+}
+const CSS = `
+  * { box-sizing: border-box; -webkit-font-smoothing: antialiased; }
+  button { font-family: inherit; cursor: pointer; }
+  button:focus-visible { outline: 2px solid ${C.accent}; outline-offset: 2px; }
+  .stage { flex: 1; position: relative; cursor: crosshair; touch-action: none; overflow: hidden;
+    background: radial-gradient(1100px 700px at 18% -10%, #14290b55 0%, transparent 60%),
+                radial-gradient(900px 600px at 95% 30%, #0b232944 0%, transparent 60%), ${T.bg}; }
+  .stage canvas { display: block; }
+  .overlay { position: absolute; inset: 0; pointer-events: none; z-index: 5; overflow: hidden; }
+  .ink-lbl { position: absolute; top: 0; left: 0; will-change: transform, opacity; white-space: nowrap;
+    font-family: ${T.mono}; text-shadow: 0 1px 6px #000000e0, 0 0 2px #000; line-height: 1.3; }
+  .ink-lbl-a { font-size: 12px; font-weight: 700; letter-spacing: 0.3px; }
+  .ink-lbl-b { font-size: 10.5px; color: ${T.mut}; }
+  .tip { position: absolute; top: 0; left: 0; z-index: 8; pointer-events: none; opacity: 0;
+    transition: opacity 120ms ease; background: #0D140Dee; border: 1px solid ${T.line};
+    border-radius: 10px; padding: 9px 12px; max-width: 236px; backdrop-filter: blur(8px);
+    box-shadow: 0 8px 28px #00000080; }
+  .tip.big { max-width: 344px; border-color: #FFFFFF22; padding: 11px 14px; }
+  .tip-name { font-family: ${T.serif}; font-style: italic; font-size: 14.5px; font-weight: 600; }
+  .tip-sub { font-family: ${T.mono}; font-size: 11px; color: ${T.mut}; margin-top: 3px; }
+  .tip-body { display: none; font-family: ${T.mono}; font-size: 11.5px; color: #C6D5C0;
+    line-height: 1.68; margin-top: 8px; padding-top: 8px; border-top: 1px solid #FFFFFF14;
+    white-space: normal; }
+  .hud { position: absolute; z-index: 10; }
+  .brand { top: 16px; left: 16px; pointer-events: none; user-select: none; }
+  .brand-eyebrow { font-size: 10px; letter-spacing: 4px; text-transform: uppercase; color: ${C.accent}; }
+  .brand-word { font-family: ${T.serif}; font-style: italic; font-weight: 600; font-size: 30px; color: #fff;
+    line-height: 1.05; margin: 2px 0 4px -1px; text-shadow: 0 0 34px ${C.accent}66; }
+  .brand-sub { font-size: 11px; color: ${T.mut}; line-height: 1.7; }
+  .prec-wrap { top: 14px; left: 50%; transform: translateX(-50%); text-align: center; }
+  .prec { display: inline-flex; background: #0B120Bdd; border: 1px solid ${T.line}; border-radius: 10px;
+    overflow: hidden; backdrop-filter: blur(8px); }
+  .prec button { border: none; padding: 8px 16px; font-family: ${T.mono}; font-size: 12.5px; font-weight: 700; letter-spacing: 1px; }
+  .prec button b { font-size: 10px; font-weight: 400; opacity: 0.75; margin-left: 7px; }
+  .prec-repo { font-size: 10.5px; margin-top: 5px; opacity: 0.85; }
+  .controls { top: 14px; right: 14px; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+  .tbtn { display: inline-flex; align-items: center; gap: 7px; border: 1px solid; border-radius: 8px;
+    padding: 6px 12px; font-family: ${T.mono}; font-size: 12px; letter-spacing: 0.5px; }
+  .iconb { width: 34px; height: 34px; border-radius: 10px; border: 1px solid ${T.line}; background: #0B120Bdd;
+    color: ${T.mut}; font-size: 15px; backdrop-filter: blur(8px); }
+  .popover { background: #0D140Df2; border: 1px solid ${T.line}; border-radius: 12px; padding: 12px;
+    display: flex; flex-direction: column; gap: 6px; box-shadow: 0 12px 40px #000000a0; backdrop-filter: blur(10px); }
+  .pop-h { font-family: ${T.serif}; font-style: italic; font-size: 14px; color: #fff; margin-bottom: 2px; }
+  .pop-b { font-size: 11.5px; color: ${T.mut}; line-height: 1.9; }
+  .stats { bottom: 16px; left: 16px; display: flex; gap: 8px; flex-wrap: wrap; max-width: 62%; pointer-events: none; }
+  .rail { width: 46px; background: #060906; border-right: 1px solid ${T.line}; display: flex;
+    flex-direction: column; flex-shrink: 0; }
+  .rail-cap { font-size: 9px; letter-spacing: 2px; color: ${T.faint}; text-align: center; padding: 8px 0; }
+  .rail-row { border-radius: 2px; margin: 1px 0; cursor: pointer; min-height: 2px; transition: background 80ms linear; }
+  .side { width: 396px; background: ${T.panel}; border-left: 1px solid ${T.line}; display: flex;
+    flex-direction: column; overflow: hidden; flex-shrink: 0; }
+  .side-h { padding: 14px 18px 12px; border-bottom: 1px solid ${T.line}; display: flex;
+    justify-content: space-between; align-items: center; gap: 10px; }
+  .side-body { flex: 1; overflow-y: auto; padding: 0 18px 18px; }
+  .side-f { border-top: 1px solid ${T.line}; padding: 10px 18px; }
+  .eyebrow { font-size: 10px; letter-spacing: 3px; text-transform: uppercase; color: ${C.accent}; margin-bottom: 3px; }
+  .chip { font-family: ${T.mono}; font-style: normal; font-size: 10px; border: 1px solid; border-radius: 5px;
+    padding: 1.5px 6px; margin-left: 8px; vertical-align: 2px; letter-spacing: 0.5px; }
+  .navb { width: 30px; height: 30px; border-radius: 8px; border: 1px solid ${T.line}; background: #FFFFFF08;
+    color: ${T.mut}; font-size: 13px; flex-shrink: 0; }
+  .navb:hover { color: #fff; border-color: ${C.accent}66; }
+  .wrow { display: flex; align-items: center; gap: 9px; padding: 6px 4px; border-bottom: 1px solid #FFFFFF06; border-radius: 4px; }
+  .wdot { width: 8px; height: 8px; border-radius: 3px; flex-shrink: 0; }
+  .wname { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wshape { display: flex; align-items: center; gap: 7px; font-size: 11px; color: ${T.mut}; font-weight: 600; }
+  .wtag { font-style: normal; font-size: 9.5px; border: 1px solid; border-radius: 4px; padding: 0 4px; }
+  .wp { display: block; font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .wb { display: block; font-size: 10.5px; color: ${T.faint}; font-variant-numeric: tabular-nums; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .legit { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: ${T.mut}; }
+  .legit i { width: 7px; height: 7px; border-radius: 2px; display: inline-block; }
+  .sheet { position: absolute; left: 0; right: 0; bottom: 0; z-index: 20; background: ${T.panel}f5;
+    border-top: 1px solid ${T.line}; border-radius: 18px 18px 0 0; backdrop-filter: blur(12px);
+    box-shadow: 0 -12px 40px #000000a0; transition: max-height 260ms ease; max-height: 68px; overflow: hidden;
+    display: flex; flex-direction: column; }
+  .sheet.open { max-height: 62vh; }
+  .sheet-h { padding: 6px 16px 12px; flex-shrink: 0; cursor: pointer; }
+  .grab { width: 40px; height: 4px; border-radius: 4px; background: #FFFFFF26; margin: 6px auto 8px; }
+  .sheet-body { overflow-y: auto; padding: 0 16px 22px; -webkit-overflow-scrolling: touch; }
+  .side-body::-webkit-scrollbar, .sheet-body::-webkit-scrollbar { width: 8px; }
+  .side-body::-webkit-scrollbar-thumb, .sheet-body::-webkit-scrollbar-thumb { background: #FFFFFF14; border-radius: 4px; }
+  @media (prefers-reduced-motion: reduce) {
+    .sheet { transition: none; } .tip { transition: none; }
+  }
+  @media (max-width: 480px) {
+    .brand-word { font-size: 22px; }
+    .prec button { padding: 7px 11px; font-size: 11.5px; }
+    .prec button b { display: none; }
+  }
+`;
+render(html`<${App} />`, document.getElementById("root"));
+</script>
+</body>
+</html>
